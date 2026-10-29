@@ -28,12 +28,6 @@ The current working database remains on SQL Server. Hosting the API on Postgres 
 
 ### Copy the current SQL Server records to PostgreSQL
 
-Do this once against an empty PostgreSQL database, after deploying the API so it has created the schema. From PowerShell in the repository root, set these process-only variables with your local SQL Server connection and the PostgreSQL URI from your host:
+After the API has deployed and created the Supabase schema, run `./scripts/Import-LocalSqlToSupabase.ps1` from PowerShell in the repository. It reads the local SQL Server connection from the ignored `backend/Shameen.Api/appsettings.Development.json` file and prompts for the Supabase Session Pooler URI with hidden input. The URI is held only in the process environment and is not written to disk or printed.
 
-```powershell
-$env:SHAMEEN_SQLSERVER_CONNECTION = 'Server=YOUR-SQL-SERVER;Database=ShameenInvestments;Trusted_Connection=True;Encrypt=False;TrustServerCertificate=True;'
-$env:DATABASE_URL = 'postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require'
-dotnet run --project backend/Shameen.DataMigration/Shameen.DataMigration.csproj
-```
-
-The migration tool prints source row counts, refuses a target that already has employees or operational records, and requires typing `IMPORT`. It replaces only the freshly seeded target branch rows and copies source branch, employee, operating day, transfer, and float adjustment IDs and values. Destination cities stay seeded by the API. The import runs in one PostgreSQL transaction. Verify counts and balances before pointing staff at production. Use a database backup and reconcile the import before live operation; this tool is intended for a one-time migration, not continuous synchronization.
+The tool prints source row counts and requires typing `IMPORT`. It refuses to proceed if the target already has any operating days, transfers, float adjustments, or employee accounts beyond the one initial administrator. When that initial administrator exists, it is replaced by the local SQL Server employee accounts. Seeded destination cities stay in place; branches, employees, operating days, transfers, and float adjustments are copied with their IDs and values in one PostgreSQL transaction. Sign in afterward using the local database administrator account. Keep a database backup and reconcile imported counts and balances before live use; this is a one-time migration, not continuous synchronization.

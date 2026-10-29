@@ -16,10 +16,12 @@ var targetOptions = new DbContextOptionsBuilder<TransferDbContext>().UseNpgsql(T
 await using var source = new TransferDbContext(sourceOptions);
 await using var target = new TransferDbContext(targetOptions);
 
-var targetHasData = await target.Employees.AnyAsync() || await target.Transactions.AnyAsync() || await target.OperatingDays.AnyAsync() || await target.FloatAdjustments.AnyAsync();
-if (targetHasData)
+var targetEmployees = await target.Employees.OrderBy(e => e.Id).ToListAsync();
+var targetHasOperationalData = await target.Transactions.AnyAsync() || await target.OperatingDays.AnyAsync() || await target.FloatAdjustments.AnyAsync();
+var hasOnlyInitialAdministrator = targetEmployees.Count == 1 && targetEmployees[0].Role == "Administrator";
+if (targetHasOperationalData || (targetEmployees.Count > 0 && !hasOnlyInitialAdministrator))
 {
-    Console.Error.WriteLine("Refusing to import: target PostgreSQL already contains employees or operational records. Use a fresh database or perform a reviewed merge.");
+    Console.Error.WriteLine("Refusing to import: target PostgreSQL contains operational records or employee accounts beyond its single initial administrator. Use a fresh database or perform a reviewed merge.");
     return 3;
 }
 
@@ -30,7 +32,8 @@ var transfers = await source.Transactions.AsNoTracking().ToListAsync();
 var adjustments = await source.FloatAdjustments.AsNoTracking().ToListAsync();
 var cities = await source.DestinationCities.AsNoTracking().ToListAsync();
 Console.WriteLine($"Ready to copy: {branches.Count} branches, {employees.Count} employees, {days.Count} operating days, {transfers.Count} transfers, {adjustments.Count} float adjustments, {cities.Count} destination cities.");
-Console.Write("Type IMPORT to replace seeded target branches and copy these SQL Server records: ");
+if (hasOnlyInitialAdministrator) Console.WriteLine("The target's initial administrator account will be replaced by the source database's employee accounts.");
+Console.Write("Type IMPORT to replace the target's initial setup data with these SQL Server records: ");
 if (!string.Equals(Console.ReadLine(), "IMPORT", StringComparison.Ordinal))
 {
     Console.WriteLine("Cancelled. No target data was changed.");
@@ -38,6 +41,8 @@ if (!string.Equals(Console.ReadLine(), "IMPORT", StringComparison.Ordinal))
 }
 
 await using var transaction = await target.Database.BeginTransactionAsync();
+target.Employees.RemoveRange(targetEmployees);
+await target.SaveChangesAsync();
 target.Branches.RemoveRange(await target.Branches.ToListAsync());
 await target.SaveChangesAsync();
 target.Branches.AddRange(branches.Select(x => new Branch { Id = x.Id, Name = x.Name, City = x.City }));
