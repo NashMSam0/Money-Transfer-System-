@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.angular/
+backend/**/bin/
+backend/**/obj/
+.build-tmp/
+**/build-output/
+**/build-obj/
+*.user
+*.suo
+.env
+.env.*
+!.env.example
+backend/Shameen.Api/appsettings.Development.json

@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: shameen-investments-api
+    runtime: docker
+    dockerfilePath: ./backend/Shameen.Api/Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+      - key: DatabaseProvider
+        value: Postgres
+      - key: DATABASE_URL
+        sync: false
+      - key: Cors__AllowedOrigins
+        sync: false
