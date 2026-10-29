@@ -198,7 +198,9 @@ app.MapGet("/api/day/current", async (TransferDbContext db, ClaimsPrincipal user
 app.MapGet("/api/dashboard", async (TransferDbContext db, ClaimsPrincipal user, DateOnly? date, int? branchId) => {
     var branch = BranchIdFor(user, branchId);
     var day = date ?? DateOnly.FromDateTime(DateTime.UtcNow);
-    var transactionsQuery = db.Transactions.Where(t => t.BranchId == branch && t.CreatedAtUtc >= day.ToDateTime(TimeOnly.MinValue) && t.CreatedAtUtc < day.AddDays(1).ToDateTime(TimeOnly.MinValue));
+    var startOfDayUtc = DateTime.SpecifyKind(day.ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
+    var startOfNextDayUtc = DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
+    var transactionsQuery = db.Transactions.Where(t => t.BranchId == branch && t.CreatedAtUtc >= startOfDayUtc && t.CreatedAtUtc < startOfNextDayUtc);
     var employeesQuery = db.Employees.Where(e => e.BranchId == branch && e.IsActive && e.Role != "Administrator");
     if (!user.IsInRole("Administrator")) { var employeeId = EmployeeIdFor(user); transactionsQuery = transactionsQuery.Where(t => t.EmployeeId == employeeId); employeesQuery = employeesQuery.Where(e => e.Id == employeeId); }
     var transactions = await transactionsQuery.ToListAsync();
@@ -269,7 +271,11 @@ app.MapGet("/api/transfers", async (TransferDbContext db, ClaimsPrincipal user, 
     var query = db.Transactions.AsNoTracking().AsQueryable();
     var branch = BranchIdFor(user, branchId); query = query.Where(t => t.BranchId == branch);
     if (!user.IsInRole("Administrator")) { var employeeId = EmployeeIdFor(user); query = query.Where(t => t.EmployeeId == employeeId); }
-    if (date is { } day) query = query.Where(t => t.CreatedAtUtc >= day.ToDateTime(TimeOnly.MinValue) && t.CreatedAtUtc < day.AddDays(1).ToDateTime(TimeOnly.MinValue));
+    if (date is { } day) {
+        var startOfDayUtc = DateTime.SpecifyKind(day.ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
+        var startOfNextDayUtc = DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
+        query = query.Where(t => t.CreatedAtUtc >= startOfDayUtc && t.CreatedAtUtc < startOfNextDayUtc);
+    }
     return Results.Ok(await query.OrderByDescending(t => t.CreatedAtUtc).Take(500).Select(t => new { t.Id, t.Reference, t.CustomerName, t.DestinationCountry, t.DestinationCity, t.Amount, t.PayoutMethod, t.Status, t.CreatedAtUtc, t.EmployeeId, t.BranchId, t.CollectedAtUtc, t.CollectionReference, t.CollectionConfirmedByEmployeeId, sendingAgent = t.Employee!.Name, sourceBranch = t.Branch!.Name }).ToListAsync());
 }).RequireAuthorization();
 app.MapPost("/api/day/open", async (OpenDayRequest request, TransferDbContext db) => {
@@ -359,8 +365,8 @@ app.MapGet("/api/collections", async (TransferDbContext db, ClaimsPrincipal user
                 join sendingAgent in db.Employees.AsNoTracking() on transfer.EmployeeId equals sendingAgent.Id
                 where transfer.DestinationCountry == employee.CollectionCountry
                     && transfer.DestinationCity == receivingCity
-                    && transfer.CreatedAtUtc >= day.ToDateTime(TimeOnly.MinValue)
-                    && transfer.CreatedAtUtc < day.AddDays(1).ToDateTime(TimeOnly.MinValue)
+                    && transfer.CreatedAtUtc >= DateTime.SpecifyKind(day.ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc)
+                    && transfer.CreatedAtUtc < DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc)
                 orderby transfer.CreatedAtUtc descending
                 select new { transfer.Id, transfer.EmployeeId, transfer.BranchId, sourceBranch = branch.Name, sendingAgent = sendingAgent.Name, transfer.Reference, transfer.CustomerName, transfer.DestinationCountry, transfer.DestinationCity, transfer.Amount, transfer.PayoutMethod, transfer.Status, transfer.CreatedAtUtc, transfer.CollectedAtUtc, transfer.CollectionReference };
     return Results.Ok(new { country = employee.CollectionCountry, transfers = await queue.Take(500).ToListAsync() });
@@ -385,7 +391,9 @@ app.MapPost("/api/day/close", async (CloseDayRequest request, TransferDbContext 
     var branchEmployees = await db.Employees.Where(e => e.BranchId == request.BranchId && e.IsActive && e.Role != "Administrator").ToListAsync();
     var employeeBalances = branchEmployees.Sum(e => e.FloatBalance);
     var unassignedFloat = Math.Max(0, operatingDay.OpeningFloat - branchEmployees.Sum(e => e.FloatAssigned));
-    var dayTransfers = await db.Transactions.Where(t => t.BranchId == request.BranchId && t.CreatedAtUtc >= day.ToDateTime(TimeOnly.MinValue) && t.CreatedAtUtc < day.AddDays(1).ToDateTime(TimeOnly.MinValue)).ToListAsync();
+    var startOfDayUtc = DateTime.SpecifyKind(day.ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
+    var startOfNextDayUtc = DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
+    var dayTransfers = await db.Transactions.Where(t => t.BranchId == request.BranchId && t.CreatedAtUtc >= startOfDayUtc && t.CreatedAtUtc < startOfNextDayUtc).ToListAsync();
     operatingDay.ClosedAtUtc = DateTime.UtcNow; operatingDay.ClosingFloat = employeeBalances + unassignedFloat; operatingDay.ClosedByEmployeeId = request.EmployeeId;
     await db.SaveChangesAsync();
     return Results.Ok(new { date = day, openingFloat = operatingDay.OpeningFloat, transfers = dayTransfers.Count, sent = dayTransfers.Where(t => t.Status is "Awaiting collection" or "Collected" or "Completed").Sum(t => t.Amount), collected = dayTransfers.Where(t => t.Status is "Collected" or "Completed").Sum(t => t.Amount), closingFloat = operatingDay.ClosingFloat, closedAtUtc = operatingDay.ClosedAtUtc });
