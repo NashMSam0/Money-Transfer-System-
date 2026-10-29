@@ -2,6 +2,7 @@ services:
   - type: web
     name: shameen-investments-api
     runtime: docker
+    plan: free
     dockerfilePath: ./backend/Shameen.Api/Dockerfile
     dockerContext: .
     healthCheckPath: /api/health
