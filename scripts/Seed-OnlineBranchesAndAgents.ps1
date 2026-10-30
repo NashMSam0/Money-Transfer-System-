@@ -12,7 +12,7 @@ if ([string]::IsNullOrWhiteSpace($sourceConnection)) {
     throw 'ConnectionStrings:Transfers is missing from the local development settings.'
 }
 
-$secureTargetUri = Read-Host 'Paste the rotated Supabase Session Pooler URI (port 5432); input is hidden' -AsSecureString
+$secureTargetUri = Read-Host 'Paste the Supabase Session Pooler URI (port 5432); input is hidden' -AsSecureString
 $secureSharedPassword = Read-Host 'Enter the password for the recreated team accounts; input is hidden' -AsSecureString
 $targetUriPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureTargetUri)
 $sharedPasswordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureSharedPassword)
