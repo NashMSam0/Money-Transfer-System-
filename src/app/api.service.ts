@@ -8,6 +8,7 @@ export class ApiService {
   authStatus() { return this.http.get<{ needsAdministratorSetup: boolean }>('/api/auth/status'); }
   me() { return this.http.get<any>('/api/auth/me'); }
   login(credentials: { email: string; password: string }) { return this.http.post('/api/auth/login', credentials); }
+  changeOwnPassword(currentPassword: string, newPassword: string) { return this.http.put('/api/auth/password', { currentPassword, newPassword }); }
   setupAdministrator(account: { name: string; email: string; password: string }) { return this.http.post('/api/auth/setup', account); }
   logout() { return this.http.post('/api/auth/logout', {}); }
   getBranches() { return this.http.get<any[]>('/api/branches'); }

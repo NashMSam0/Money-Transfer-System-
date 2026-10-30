@@ -7,6 +7,7 @@ using Shameen.Api.Models;
 var sourceConnection = Environment.GetEnvironmentVariable("SHAMEEN_SQLSERVER_CONNECTION");
 var targetConnection = Environment.GetEnvironmentVariable("DATABASE_URL");
 var sharedPassword = Environment.GetEnvironmentVariable("SHAMEEN_SEED_PASSWORD");
+var supervisorsOnly = args.Contains("--supervisors-only", StringComparer.OrdinalIgnoreCase);
 if (string.IsNullOrWhiteSpace(sourceConnection) || string.IsNullOrWhiteSpace(targetConnection) || string.IsNullOrWhiteSpace(sharedPassword))
 {
     Console.Error.WriteLine("The local SQL connection, Supabase Session Pooler URI, and account password must be supplied through the helper script.");
@@ -19,11 +20,12 @@ await using var source = new TransferDbContext(sourceOptions);
 await using var target = new TransferDbContext(targetOptions);
 
 var sourceBranches = await source.Branches.AsNoTracking().OrderBy(b => b.Id).ToListAsync();
-var sourceEmployees = await source.Employees.AsNoTracking().Include(e => e.Branch).Where(e => e.Role != "Administrator").OrderBy(e => e.Id)
+var sourceEmployees = await source.Employees.AsNoTracking().Include(e => e.Branch).Where(e => e.Role != "Administrator" && e.Role != "Supervisor").OrderBy(e => e.Id)
     .Select(e => new { e.Name, e.Email, e.Role, BranchCity = e.Branch!.City, e.CollectionCountry, e.IsActive })
     .ToListAsync();
+var teamEmployees = sourceEmployees.Where(_ => !supervisorsOnly).ToList();
 
-if (sourceBranches.Count == 0 || sourceEmployees.Count == 0)
+if (sourceBranches.Count == 0 || (!supervisorsOnly && teamEmployees.Count == 0))
 {
     Console.Error.WriteLine("The local database did not contain branches and non-administrator employee accounts to seed.");
     return 3;
@@ -48,7 +50,7 @@ foreach (var sourceBranch in sourceBranches)
     branchByCity[sourceBranch.City] = hostedBranch;
 }
 
-var unmappedEmployees = sourceEmployees.Count(e => !branchByCity.ContainsKey(e.BranchCity));
+var unmappedEmployees = teamEmployees.Count(e => !branchByCity.ContainsKey(e.BranchCity));
 if (unmappedEmployees > 0)
 {
     Console.Error.WriteLine($"Refusing to continue: {unmappedEmployees} source employee accounts have no matching source branch city.");
@@ -57,9 +59,26 @@ if (unmappedEmployees > 0)
 
 var hostedEmployees = await target.Employees.Where(e => e.Role != "Administrator").ToListAsync();
 var hostedByEmail = hostedEmployees.ToDictionary(e => e.Email, StringComparer.OrdinalIgnoreCase);
-var accountsToCreate = sourceEmployees.Count(e => !hostedByEmail.ContainsKey(e.Email));
-var accountsToUpdate = sourceEmployees.Count - accountsToCreate;
-Console.WriteLine($"Ready to ensure {sourceBranches.Count} branches and {sourceEmployees.Count} non-administrator accounts ({accountsToCreate} new, {accountsToUpdate} existing).");
+var accountsToCreate = teamEmployees.Count(e => !hostedByEmail.ContainsKey(e.Email));
+var accountsToUpdate = teamEmployees.Count - accountsToCreate;
+var supervisorAccounts = branchByCity.Select(pair => {
+    var slug = System.Text.RegularExpressions.Regex.Replace(pair.Key.ToLowerInvariant(), "[^a-z0-9]+", ".").Trim('.');
+    var email = $"supervisor.{slug}@shameen.local";
+    return (City: pair.Key, Branch: pair.Value, Email: email);
+}).ToList();
+if (supervisorAccounts.Select(account => account.Email).Distinct(StringComparer.OrdinalIgnoreCase).Count() != supervisorAccounts.Count)
+{
+    Console.Error.WriteLine("Refusing to continue: two branch cities produce the same supervisor email address.");
+    return 5;
+}
+var conflictingSupervisors = supervisorAccounts.Where(account => hostedByEmail.TryGetValue(account.Email, out var employee) && employee.Role != "Supervisor").ToList();
+if (conflictingSupervisors.Count > 0)
+{
+    Console.Error.WriteLine($"Refusing to continue: {conflictingSupervisors.Count} generated supervisor email(s) already belong to non-supervisor accounts.");
+    return 5;
+}
+var supervisorsToCreate = supervisorAccounts.Count(account => !hostedByEmail.ContainsKey(account.Email));
+Console.WriteLine($"Ready to ensure {sourceBranches.Count} branches, {teamEmployees.Count} team accounts, and {supervisorAccounts.Count} city supervisors ({accountsToCreate} team accounts and {supervisorsToCreate} supervisors new).");
 Console.WriteLine("The hosted administrator is preserved. Operating days, transfers, and float adjustments will not be changed.");
 Console.Write("Type SEED to create/update branches and team accounts only: ");
 if (!string.Equals(Console.ReadLine(), "SEED", StringComparison.Ordinal))
@@ -71,7 +90,7 @@ if (!string.Equals(Console.ReadLine(), "SEED", StringComparison.Ordinal))
 await using var transaction = await target.Database.BeginTransactionAsync();
 await target.SaveChangesAsync();
 var hasher = new PasswordHasher<Employee>();
-foreach (var sourceEmployee in sourceEmployees)
+foreach (var sourceEmployee in teamEmployees)
 {
     if (!hostedByEmail.TryGetValue(sourceEmployee.Email, out var employee))
     {
@@ -91,9 +110,28 @@ foreach (var sourceEmployee in sourceEmployees)
     employee.PasswordHash = hasher.HashPassword(employee, sharedPassword);
 }
 
+foreach (var account in supervisorAccounts)
+{
+    if (!hostedByEmail.TryGetValue(account.Email, out var supervisor))
+    {
+        supervisor = new Employee { Email = account.Email };
+        target.Employees.Add(supervisor);
+        hostedByEmail[account.Email] = supervisor;
+    }
+    supervisor.Name = $"City Supervisor - {account.City}";
+    supervisor.Role = "Supervisor";
+    supervisor.BranchId = account.Branch.Id;
+    supervisor.CollectionCountry = null;
+    supervisor.IsActive = true;
+    supervisor.FloatAssigned = 0;
+    supervisor.FloatBalance = 0;
+    supervisor.FloatEnteredDayId = null;
+    supervisor.PasswordHash = hasher.HashPassword(supervisor, sharedPassword);
+}
+
 await target.SaveChangesAsync();
 await transaction.CommitAsync();
-Console.WriteLine($"Seed complete. Ensured {sourceBranches.Count} branches and {sourceEmployees.Count} employee accounts. No operational history was copied.");
+Console.WriteLine($"Seed complete. Ensured {sourceBranches.Count} branches, {teamEmployees.Count} employee accounts, and {supervisorAccounts.Count} city supervisors. No operational history was copied.");
 return 0;
 
 static string ToNpgsql(string value)

@@ -11,6 +11,7 @@ public sealed record CreateTransferRequest(int EmployeeId, string CustomerName, 
 public sealed record CloseDayRequest(int? EmployeeId, int BranchId);
 public sealed record CreateEmployeeRequest(string Name, string Email, string Role, int BranchId, string Password);
 public sealed record SetEmployeeCredentialsRequest(string Password);
+public sealed record ChangeOwnPasswordRequest(string CurrentPassword, string NewPassword);
 public sealed record SetFloatRequest(decimal Amount, string? Reason);
 public sealed record ConfirmCollectionRequest(string? CollectionReference);
 public sealed record UpdateDestinationCityRequest(string DestinationCity);

@@ -1,3 +1,5 @@
+param([switch]$SupervisorsOnly)
+
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -23,7 +25,9 @@ try {
     $env:DATABASE_URL = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($targetUriPointer)
     $env:SHAMEEN_SEED_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($sharedPasswordPointer)
     Set-Location -LiteralPath $repoRoot
-    dotnet run --project backend/Shameen.TeamSeeder/Shameen.TeamSeeder.csproj
+    $dotnetArguments = @('run', '--project', 'backend/Shameen.TeamSeeder/Shameen.TeamSeeder.csproj')
+    if ($SupervisorsOnly) { $dotnetArguments += @('--', '--supervisors-only') }
+    & dotnet @dotnetArguments
     if ($LASTEXITCODE -ne 0) {
         throw "The seeder exited with code $LASTEXITCODE. No write was committed unless it reported success."
     }

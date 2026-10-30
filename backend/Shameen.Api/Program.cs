@@ -143,7 +143,7 @@ ClaimsPrincipal PrincipalFor(Employee employee) {
         new(ClaimTypes.NameIdentifier, employee.Id.ToString()),
         new(ClaimTypes.Name, employee.Name),
         new(ClaimTypes.Email, employee.Email),
-        new(ClaimTypes.Role, employee.Role == "Administrator" ? "Administrator" : "Employee"),
+        new(ClaimTypes.Role, employee.Role),
         new("branch_id", employee.BranchId.ToString())
     };
     if (!string.IsNullOrWhiteSpace(employee.CollectionCountry)) { claims.Add(new Claim(ClaimTypes.Role, "CollectionAgent")); claims.Add(new Claim("collection_country", employee.CollectionCountry)); }
@@ -151,6 +151,8 @@ ClaimsPrincipal PrincipalFor(Employee employee) {
 }
 int EmployeeIdFor(ClaimsPrincipal user) => int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
 int BranchIdFor(ClaimsPrincipal user, int? requested) => user.IsInRole("Administrator") ? requested ?? 1 : int.Parse(user.FindFirstValue("branch_id")!);
+bool IsManager(ClaimsPrincipal user) => user.IsInRole("Administrator") || user.IsInRole("Supervisor");
+bool CanManageBranch(ClaimsPrincipal user, int branchId) => user.IsInRole("Administrator") || (user.IsInRole("Supervisor") && BranchIdFor(user, null) == branchId);
 object EmployeeView(Employee employee) => new { employee.Id, employee.BranchId, employee.Name, employee.Email, employee.Role, employee.CollectionCountry, employee.IsActive, employee.FloatAssigned, employee.FloatBalance, hasLogin = employee.PasswordHash != null };
 
 app.MapGet("/api/auth/status", async (TransferDbContext db) => Results.Ok(new { needsAdministratorSetup = !await db.Employees.AnyAsync(e => e.Role == "Administrator") })).AllowAnonymous();
@@ -176,6 +178,16 @@ app.MapPost("/api/auth/login", async (LoginRequest request, TransferDbContext db
     await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, PrincipalFor(employee), new AuthenticationProperties { IsPersistent = true, ExpiresUtc = DateTimeOffset.UtcNow.AddHours(10) });
     return Results.Ok(new { employee.Id, employee.Name, employee.Email, employee.Role, employee.BranchId });
 }).AllowAnonymous();
+app.MapPut("/api/auth/password", async (ChangeOwnPasswordRequest request, ClaimsPrincipal user, TransferDbContext db, PasswordHasher<Employee> hasher) => {
+    if (string.IsNullOrWhiteSpace(request.NewPassword) || request.NewPassword.Length < 12) return Results.ValidationProblem(new Dictionary<string, string[]> { ["newPassword"] = ["New password must be at least 12 characters."] });
+    var employeeId = EmployeeIdFor(user);
+    var employee = await db.Employees.SingleOrDefaultAsync(e => e.Id == employeeId && e.IsActive);
+    if (employee?.PasswordHash is null || string.IsNullOrEmpty(request.CurrentPassword) || hasher.VerifyHashedPassword(employee, employee.PasswordHash, request.CurrentPassword) == PasswordVerificationResult.Failed)
+        return Results.ValidationProblem(new Dictionary<string, string[]> { ["currentPassword"] = ["Current password is incorrect."] });
+    employee.PasswordHash = hasher.HashPassword(employee, request.NewPassword);
+    await db.SaveChangesAsync();
+    return Results.NoContent();
+}).RequireAuthorization();
 app.MapGet("/api/auth/me", async (ClaimsPrincipal user, TransferDbContext db) => {
     var id = EmployeeIdFor(user);
     var employee = await db.Employees.Include(e => e.Branch).SingleOrDefaultAsync(e => e.Id == id && e.IsActive);
@@ -202,7 +214,7 @@ app.MapGet("/api/dashboard", async (TransferDbContext db, ClaimsPrincipal user, 
     var startOfNextDayUtc = DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
     var transactionsQuery = db.Transactions.Where(t => t.BranchId == branch && t.CreatedAtUtc >= startOfDayUtc && t.CreatedAtUtc < startOfNextDayUtc);
     var employeesQuery = db.Employees.Where(e => e.BranchId == branch && e.IsActive && e.Role != "Administrator");
-    if (!user.IsInRole("Administrator")) { var employeeId = EmployeeIdFor(user); transactionsQuery = transactionsQuery.Where(t => t.EmployeeId == employeeId); employeesQuery = employeesQuery.Where(e => e.Id == employeeId); }
+    if (!IsManager(user)) { var employeeId = EmployeeIdFor(user); transactionsQuery = transactionsQuery.Where(t => t.EmployeeId == employeeId); employeesQuery = employeesQuery.Where(e => e.Id == employeeId); }
     var transactions = await transactionsQuery.ToListAsync();
     var agents = await employeesQuery.Select(e => new { e.Id, e.BranchId, e.Name, e.Email, e.Role, e.IsActive, e.FloatAssigned, e.FloatBalance }).ToListAsync();
     var operatingDay = await db.OperatingDays.SingleOrDefaultAsync(d => d.Date == day && d.BranchId == branch);
@@ -214,31 +226,38 @@ app.MapGet("/api/dashboard", async (TransferDbContext db, ClaimsPrincipal user, 
 app.MapGet("/api/employees", async (TransferDbContext db, ClaimsPrincipal user, int? branchId) => {
     var query = db.Employees.Where(e => e.Role != "Administrator").AsQueryable();
     if (user.IsInRole("Administrator")) { if (branchId is { } requested) query = query.Where(e => e.BranchId == requested); }
+    else if (user.IsInRole("Supervisor")) { var branchIdForSupervisor = BranchIdFor(user, null); query = query.Where(e => e.BranchId == branchIdForSupervisor); }
     else { var employeeId = EmployeeIdFor(user); query = query.Where(e => e.Id == employeeId); }
     return Results.Ok(await query.OrderBy(e => e.Name).Select(e => new { e.Id, e.BranchId, e.Name, e.Email, e.Role, e.CollectionCountry, e.IsActive, e.FloatAssigned, e.FloatBalance, hasLogin = e.PasswordHash != null }).ToListAsync());
 }).RequireAuthorization();
-app.MapPost("/api/employees", async (CreateEmployeeRequest request, TransferDbContext db, PasswordHasher<Employee> hasher) => {
+app.MapPost("/api/employees", async (CreateEmployeeRequest request, TransferDbContext db, PasswordHasher<Employee> hasher, ClaimsPrincipal user) => {
     if (string.IsNullOrWhiteSpace(request.Name) || string.IsNullOrWhiteSpace(request.Email) || !request.Email.Contains('@'))
         return Results.ValidationProblem(new Dictionary<string, string[]> { ["employee"] = ["Enter a name and valid email address."] });
     if (request.Password.Length < 12) return Results.ValidationProblem(new Dictionary<string, string[]> { ["password"] = ["Password must be at least 12 characters."] });
     var email = request.Email.Trim().ToLowerInvariant();
     if (await db.Employees.AnyAsync(e => e.Email == email)) return Results.Conflict(new { message = "An employee with this email already exists." });
+    if (!CanManageBranch(user, request.BranchId)) return Results.Forbid();
     if (!await db.Branches.AnyAsync(b => b.Id == request.BranchId)) return Results.NotFound(new { message = "The selected transfer branch was not found." });
-    var employee = new Employee { Name = request.Name.Trim(), Email = email, Role = string.IsNullOrWhiteSpace(request.Role) ? "Transfer agent" : request.Role.Trim(), BranchId = request.BranchId };
+    var role = string.IsNullOrWhiteSpace(request.Role) ? "Transfer agent" : request.Role.Trim();
+    if (role is not ("Transfer agent" or "Senior agent" or "Supervisor")) return Results.ValidationProblem(new Dictionary<string, string[]> { ["role"] = ["Choose Transfer agent, Senior agent, or Supervisor."] });
+    if (role == "Supervisor" && !user.IsInRole("Administrator")) return Results.Forbid();
+    var employee = new Employee { Name = request.Name.Trim(), Email = email, Role = role, BranchId = request.BranchId };
     employee.PasswordHash = hasher.HashPassword(employee, request.Password);
     db.Employees.Add(employee); await db.SaveChangesAsync();
     return Results.Created($"/api/employees/{employee.Id}", EmployeeView(employee));
-}).RequireAuthorization("AdminOnly");
-app.MapPut("/api/employees/{id:int}/credentials", async (int id, SetEmployeeCredentialsRequest request, TransferDbContext db, PasswordHasher<Employee> hasher) => {
+}).RequireAuthorization();
+app.MapPut("/api/employees/{id:int}/credentials", async (int id, SetEmployeeCredentialsRequest request, TransferDbContext db, PasswordHasher<Employee> hasher, ClaimsPrincipal user) => {
     if (request.Password.Length < 12) return Results.ValidationProblem(new Dictionary<string, string[]> { ["password"] = ["Password must be at least 12 characters."] });
     var employee = await db.Employees.FindAsync(id);
     if (employee is null) return Results.NotFound(new { message = "Employee not found." });
+    if (employee.Role == "Administrator" || !CanManageBranch(user, employee.BranchId) || (user.IsInRole("Supervisor") && employee.Role == "Supervisor")) return Results.Forbid();
     employee.PasswordHash = hasher.HashPassword(employee, request.Password); await db.SaveChangesAsync();
     return Results.NoContent();
-}).RequireAuthorization("AdminOnly");
-app.MapPut("/api/employees/{id:int}/collection-country", async (int id, AssignCollectionCountryRequest request, TransferDbContext db) => {
+}).RequireAuthorization();
+app.MapPut("/api/employees/{id:int}/collection-country", async (int id, AssignCollectionCountryRequest request, TransferDbContext db, ClaimsPrincipal user) => {
     var employee = await db.Employees.SingleOrDefaultAsync(e => e.Id == id);
     if (employee is null) return Results.NotFound(new { message = "Employee not found." });
+    if (employee.Role == "Administrator" || !CanManageBranch(user, employee.BranchId) || (user.IsInRole("Supervisor") && employee.Role == "Supervisor")) return Results.Forbid();
     if (string.IsNullOrWhiteSpace(request.Country)) employee.CollectionCountry = null;
     else {
         var country = supportedCollectionCountries.FirstOrDefault(c => string.Equals(c, request.Country.Trim(), StringComparison.OrdinalIgnoreCase));
@@ -247,11 +266,11 @@ app.MapPut("/api/employees/{id:int}/collection-country", async (int id, AssignCo
     }
     await db.SaveChangesAsync();
     return Results.Ok(new { employee.Id, employee.CollectionCountry });
-}).RequireAuthorization("AdminOnly");
+}).RequireAuthorization();
 app.MapPut("/api/transfers/{id:long}/destination-city", async (long id, UpdateDestinationCityRequest request, TransferDbContext db, ClaimsPrincipal user) => {
     var transfer = await db.Transactions.SingleOrDefaultAsync(t => t.Id == id);
     if (transfer is null) return Results.NotFound(new { message = "Transfer not found." });
-    if (!user.IsInRole("Administrator") && transfer.EmployeeId != EmployeeIdFor(user)) return Results.Forbid();
+    if (!user.IsInRole("Administrator") && !(user.IsInRole("Supervisor") && CanManageBranch(user, transfer.BranchId)) && transfer.EmployeeId != EmployeeIdFor(user)) return Results.Forbid();
     if (transfer.Status != "Awaiting collection") return Results.Conflict(new { message = "Destination city can only be changed while the transfer is awaiting collection." });
     if (string.IsNullOrWhiteSpace(request.DestinationCity)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["destinationCity"] = ["Enter or select a destination city."] });
     var destinationCity = request.DestinationCity.Trim();
@@ -270,7 +289,7 @@ app.MapGet("/api/destination-cities", async (TransferDbContext db) => Results.Ok
 app.MapGet("/api/transfers", async (TransferDbContext db, ClaimsPrincipal user, DateOnly? date, int? branchId) => {
     var query = db.Transactions.AsNoTracking().AsQueryable();
     var branch = BranchIdFor(user, branchId); query = query.Where(t => t.BranchId == branch);
-    if (!user.IsInRole("Administrator")) { var employeeId = EmployeeIdFor(user); query = query.Where(t => t.EmployeeId == employeeId); }
+    if (!IsManager(user)) { var employeeId = EmployeeIdFor(user); query = query.Where(t => t.EmployeeId == employeeId); }
     if (date is { } day) {
         var startOfDayUtc = DateTime.SpecifyKind(day.ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
         var startOfNextDayUtc = DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
@@ -278,17 +297,19 @@ app.MapGet("/api/transfers", async (TransferDbContext db, ClaimsPrincipal user, 
     }
     return Results.Ok(await query.OrderByDescending(t => t.CreatedAtUtc).Take(500).Select(t => new { t.Id, t.Reference, t.CustomerName, t.DestinationCountry, t.DestinationCity, t.Amount, t.PayoutMethod, t.Status, t.CreatedAtUtc, t.EmployeeId, t.BranchId, t.CollectedAtUtc, t.CollectionReference, t.CollectionConfirmedByEmployeeId, sendingAgent = t.Employee!.Name, sourceBranch = t.Branch!.Name }).ToListAsync());
 }).RequireAuthorization();
-app.MapPost("/api/day/open", async (OpenDayRequest request, TransferDbContext db) => {
+app.MapPost("/api/day/open", async (OpenDayRequest request, TransferDbContext db, ClaimsPrincipal user) => {
     if (request.OpeningFloat <= 0) return Results.ValidationProblem(new Dictionary<string, string[]> { ["openingFloat"] = ["Opening float must be greater than zero."] });
-    if (!await db.Branches.AnyAsync(b => b.Id == request.BranchId)) return Results.NotFound(new { message = "The selected transfer branch was not found." });
+    var branchId = BranchIdFor(user, request.BranchId);
+    if (!CanManageBranch(user, branchId)) return Results.Forbid();
+    if (!await db.Branches.AnyAsync(b => b.Id == branchId)) return Results.NotFound(new { message = "The selected transfer branch was not found." });
     var day = DateOnly.FromDateTime(DateTime.UtcNow);
-    if (await db.OperatingDays.AnyAsync(d => d.Date == day && d.BranchId == request.BranchId && d.ClosedAtUtc == null)) return Results.Conflict(new { message = "An operating day is already open for this branch." });
-    var record = new OperatingDay { BranchId = request.BranchId, Date = day, OpeningFloat = request.OpeningFloat, OpenedAtUtc = DateTime.UtcNow, OpenedByEmployeeId = request.EmployeeId };
-    var employees = await db.Employees.Where(e => e.BranchId == request.BranchId && e.IsActive && e.Role != "Administrator").OrderBy(e => e.Id).ToListAsync();
+    if (await db.OperatingDays.AnyAsync(d => d.Date == day && d.BranchId == branchId && d.ClosedAtUtc == null)) return Results.Conflict(new { message = "An operating day is already open for this branch." });
+    var record = new OperatingDay { BranchId = branchId, Date = day, OpeningFloat = request.OpeningFloat, OpenedAtUtc = DateTime.UtcNow, OpenedByEmployeeId = EmployeeIdFor(user) };
+    var employees = await db.Employees.Where(e => e.BranchId == branchId && e.IsActive && e.Role != "Administrator").OrderBy(e => e.Id).ToListAsync();
     if (employees.Count == 0) return Results.Conflict(new { message = "Add an active employee before opening the day." });
     foreach (var employee in employees) { employee.FloatAssigned = 0; employee.FloatBalance = 0; employee.FloatEnteredDayId = null; }
     db.OperatingDays.Add(record); await db.SaveChangesAsync(); return Results.Created($"/api/day/{record.Id}", record);
-}).RequireAuthorization("AdminOnly");
+}).RequireAuthorization();
 app.MapPost("/api/float/my", async (SetFloatRequest request, TransferDbContext db, ClaimsPrincipal user) => {
     if (user.IsInRole("Administrator")) return Results.Forbid();
     if (request.Amount <= 0 || decimal.Round(request.Amount, 2) != request.Amount) return Results.ValidationProblem(new Dictionary<string, string[]> { ["amount"] = ["Enter a float greater than zero with no more than two decimal places."] });
@@ -313,6 +334,7 @@ app.MapPut("/api/employees/{id:int}/float", async (int id, SetFloatRequest reque
     await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
     var employee = await db.Employees.SingleOrDefaultAsync(e => e.Id == id && e.Role != "Administrator");
     if (employee is null) return Results.NotFound(new { message = "Employee not found." });
+    if (employee.Role == "Administrator" || !CanManageBranch(user, employee.BranchId)) return Results.Forbid();
     var today = DateOnly.FromDateTime(DateTime.UtcNow);
     var operatingDay = await db.OperatingDays.SingleOrDefaultAsync(d => d.Date == today && d.BranchId == employee.BranchId && d.ClosedAtUtc == null);
     if (operatingDay is null) return Results.Conflict(new { message = "Open the operating day before adjusting employee float." });
@@ -326,7 +348,7 @@ app.MapPut("/api/employees/{id:int}/float", async (int id, SetFloatRequest reque
     db.FloatAdjustments.Add(new FloatAdjustment { OperatingDayId = operatingDay.Id, EmployeeId = employee.Id, ActorEmployeeId = EmployeeIdFor(user), PreviousAmount = previousAmount, NewAmount = request.Amount, Reason = request.Reason.Trim(), CreatedAtUtc = DateTime.UtcNow });
     await db.SaveChangesAsync(); await tx.CommitAsync();
     return Results.Ok(new { employee.Id, employee.FloatAssigned, employee.FloatBalance });
-}).RequireAuthorization("AdminOnly");
+}).RequireAuthorization();
 app.MapPost("/api/transfers", async (CreateTransferRequest request, TransferDbContext db, ClaimsPrincipal user) => {
     if (request.Amount <= 0 || string.IsNullOrWhiteSpace(request.CustomerName)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["request"] = ["Customer and a positive amount are required."] });
     if (string.IsNullOrWhiteSpace(request.DestinationCountry)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["destinationCountry"] = ["Select a destination country."] });
@@ -344,7 +366,8 @@ app.MapPost("/api/transfers", async (CreateTransferRequest request, TransferDbCo
     var day = DateOnly.FromDateTime(DateTime.UtcNow);
     var branchId = BranchIdFor(user, request.BranchId);
     if (!await db.OperatingDays.AnyAsync(d => d.Date == day && d.BranchId == branchId && d.ClosedAtUtc == null)) return Results.Conflict(new { message = "Open the operating day for this branch before recording transfers." });
-    var employeeId = user.IsInRole("Administrator") ? request.EmployeeId : EmployeeIdFor(user);
+    var employeeId = IsManager(user) ? request.EmployeeId : EmployeeIdFor(user);
+    if (!CanManageBranch(user, branchId)) return Results.Forbid();
     var employee = await db.Employees.SingleOrDefaultAsync(e => e.Id == employeeId && e.BranchId == branchId && e.IsActive);
     if (employee is null) return Results.NotFound(new { message = "Active employee was not found." });
     if (employee.FloatBalance < request.Amount) return Results.Conflict(new { message = "Insufficient employee float.", availableFloat = employee.FloatBalance });
@@ -384,20 +407,22 @@ app.MapPost("/api/transfers/{id:long}/collection", async (long id, ConfirmCollec
     await db.SaveChangesAsync(); await confirmationTransaction.CommitAsync();
     return Results.Ok(new { transfer.Id, transfer.Reference, transfer.Status, transfer.CollectedAtUtc, transfer.CollectionReference, transfer.CollectionConfirmedByEmployeeId });
 }).RequireAuthorization();
-app.MapPost("/api/day/close", async (CloseDayRequest request, TransferDbContext db) => {
+app.MapPost("/api/day/close", async (CloseDayRequest request, TransferDbContext db, ClaimsPrincipal user) => {
+    var branchId = BranchIdFor(user, request.BranchId);
+    if (!CanManageBranch(user, branchId)) return Results.Forbid();
     var day = DateOnly.FromDateTime(DateTime.UtcNow);
-    var operatingDay = await db.OperatingDays.SingleOrDefaultAsync(d => d.Date == day && d.BranchId == request.BranchId && d.ClosedAtUtc == null);
+    var operatingDay = await db.OperatingDays.SingleOrDefaultAsync(d => d.Date == day && d.BranchId == branchId && d.ClosedAtUtc == null);
     if (operatingDay is null) return Results.NotFound(new { message = "No open operating day was found." });
-    var branchEmployees = await db.Employees.Where(e => e.BranchId == request.BranchId && e.IsActive && e.Role != "Administrator").ToListAsync();
+    var branchEmployees = await db.Employees.Where(e => e.BranchId == branchId && e.IsActive && e.Role != "Administrator").ToListAsync();
     var employeeBalances = branchEmployees.Sum(e => e.FloatBalance);
     var unassignedFloat = Math.Max(0, operatingDay.OpeningFloat - branchEmployees.Sum(e => e.FloatAssigned));
     var startOfDayUtc = DateTime.SpecifyKind(day.ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
     var startOfNextDayUtc = DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
-    var dayTransfers = await db.Transactions.Where(t => t.BranchId == request.BranchId && t.CreatedAtUtc >= startOfDayUtc && t.CreatedAtUtc < startOfNextDayUtc).ToListAsync();
-    operatingDay.ClosedAtUtc = DateTime.UtcNow; operatingDay.ClosingFloat = employeeBalances + unassignedFloat; operatingDay.ClosedByEmployeeId = request.EmployeeId;
+    var dayTransfers = await db.Transactions.Where(t => t.BranchId == branchId && t.CreatedAtUtc >= startOfDayUtc && t.CreatedAtUtc < startOfNextDayUtc).ToListAsync();
+    operatingDay.ClosedAtUtc = DateTime.UtcNow; operatingDay.ClosingFloat = employeeBalances + unassignedFloat; operatingDay.ClosedByEmployeeId = EmployeeIdFor(user);
     await db.SaveChangesAsync();
     return Results.Ok(new { date = day, openingFloat = operatingDay.OpeningFloat, transfers = dayTransfers.Count, sent = dayTransfers.Where(t => t.Status is "Awaiting collection" or "Collected" or "Completed").Sum(t => t.Amount), collected = dayTransfers.Where(t => t.Status is "Collected" or "Completed").Sum(t => t.Amount), closingFloat = operatingDay.ClosingFloat, closedAtUtc = operatingDay.ClosedAtUtc });
-}).RequireAuthorization("AdminOnly");
+}).RequireAuthorization();
 app.Run();
 
 
