@@ -1,16 +1,20 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { forkJoin } from 'rxjs';
+import { finalize, tap } from 'rxjs/operators';
 
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private readonly http = inject(HttpClient);
+  private readonly sessionKey = 'shameen.tabSession';
   authStatus() { return this.http.get<{ needsAdministratorSetup: boolean }>('/api/auth/status'); }
   me() { return this.http.get<any>('/api/auth/me'); }
-  login(credentials: { email: string; password: string }) { return this.http.post('/api/auth/login', credentials); }
+  login(credentials: { email: string; password: string }) { return this.http.post<any>('/api/auth/login', credentials).pipe(tap(response => this.storeSession(response))); }
   changeOwnPassword(currentPassword: string, newPassword: string) { return this.http.put('/api/auth/password', { currentPassword, newPassword }); }
-  setupAdministrator(account: { name: string; email: string; password: string }) { return this.http.post('/api/auth/setup', account); }
-  logout() { return this.http.post('/api/auth/logout', {}); }
+  setupAdministrator(account: { name: string; email: string; password: string }) { return this.http.post<any>('/api/auth/setup', account).pipe(tap(response => this.storeSession(response))); }
+  logout() { return this.http.post('/api/auth/logout', {}).pipe(finalize(() => sessionStorage.removeItem(this.sessionKey))); }
+  sessionToken() { return sessionStorage.getItem(this.sessionKey); }
+  private storeSession(response: any) { if (response?.sessionToken) sessionStorage.setItem(this.sessionKey, response.sessionToken); }
   getBranches() { return this.http.get<any[]>('/api/branches'); }
   getLocations() { return this.http.get<Array<{id:number;name:string;city:string;country:string}>>('/api/locations'); }
   getDestinationCities() { return this.http.get<Array<{country:string;city:string}>>('/api/destination-cities'); }

@@ -22,6 +22,41 @@ namespace Shameen.Api.Data.Migrations.Postgres
 
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
 
+            modelBuilder.Entity("Shameen.Api.Models.AuthSession", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("EmployeeId")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime>("ExpiresAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime?>("RevokedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("TokenHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TokenHash")
+                        .IsUnique();
+
+                    b.HasIndex("EmployeeId", "ExpiresAtUtc");
+
+                    b.ToTable("AuthSessions");
+                });
+
             modelBuilder.Entity("Shameen.Api.Models.Branch", b =>
                 {
                     b.Property<int>("Id")
@@ -292,6 +327,17 @@ namespace Shameen.Api.Data.Migrations.Postgres
                     b.HasIndex("BranchId", "CreatedAtUtc");
 
                     b.ToTable("Transactions");
+                });
+
+            modelBuilder.Entity("Shameen.Api.Models.AuthSession", b =>
+                {
+                    b.HasOne("Shameen.Api.Models.Employee", "Employee")
+                        .WithMany()
+                        .HasForeignKey("EmployeeId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Employee");
                 });
 
             modelBuilder.Entity("Shameen.Api.Models.Employee", b =>

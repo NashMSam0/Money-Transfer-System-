@@ -1,11 +1,13 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi.Models;
 using Microsoft.AspNetCore.Authentication;
-using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Identity;
 using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
 using Shameen.Api.Data;
 using Shameen.Api.Models;
+using Shameen.Api;
 
 static string NormalizePostgresConnectionString(string value) {
     if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) || (uri.Scheme != "postgres" && uri.Scheme != "postgresql")) return value;
@@ -36,24 +38,7 @@ builder.Services.AddDbContext<TransferDbContext>(options => {
 var allowedOrigins = (builder.Configuration["Cors:AllowedOrigins"] ?? "http://localhost:4200,http://localhost:4201")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 builder.Services.AddCors(options => options.AddDefaultPolicy(policy => policy.WithOrigins(allowedOrigins).AllowAnyHeader().AllowAnyMethod().AllowCredentials()));
-builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme).AddCookie(options => {
-    options.Cookie.Name = ".Shameen.Session"; options.Cookie.HttpOnly = true; options.Cookie.SameSite = SameSiteMode.Lax; options.Cookie.SecurePolicy = builder.Environment.IsProduction() ? CookieSecurePolicy.Always : CookieSecurePolicy.SameAsRequest;
-    options.ExpireTimeSpan = TimeSpan.FromHours(10); options.SlidingExpiration = true;
-    options.Events.OnRedirectToLogin = context => { context.Response.StatusCode = StatusCodes.Status401Unauthorized; return Task.CompletedTask; };
-    options.Events.OnRedirectToAccessDenied = context => { context.Response.StatusCode = StatusCodes.Status403Forbidden; return Task.CompletedTask; };
-    options.Events.OnValidatePrincipal = async context => {
-        var user = context.Principal;
-        if (!int.TryParse(user?.FindFirstValue(ClaimTypes.NameIdentifier), out var employeeId)) { context.RejectPrincipal(); return; }
-        var db = context.HttpContext.RequestServices.GetRequiredService<TransferDbContext>();
-        var currentBranchId = await db.Employees.AsNoTracking().Where(e => e.Id == employeeId && e.IsActive).Select(e => (int?)e.BranchId).SingleOrDefaultAsync();
-        if (currentBranchId is null) { context.RejectPrincipal(); return; }
-        if (user?.FindFirstValue("branch_id") != currentBranchId.Value.ToString()) {
-            var employee = await db.Employees.Include(e => e.Branch).SingleAsync(e => e.Id == employeeId);
-            context.ReplacePrincipal(PrincipalFor(employee));
-            context.ShouldRenew = true;
-        }
-    };
-});
+builder.Services.AddAuthentication("TabSession").AddScheme<AuthenticationSchemeOptions, TabSessionAuthenticationHandler>("TabSession", _ => { });
 builder.Services.AddAuthorization(options => options.AddPolicy("AdminOnly", policy => policy.RequireRole("Administrator")));
 builder.Services.AddScoped<PasswordHasher<Employee>>();
 builder.Services.AddEndpointsApiExplorer();
@@ -98,6 +83,9 @@ await using (var scope = app.Services.CreateAsyncScope())
         IF COL_LENGTH(N'dbo.Employees', N'PasswordHash') IS NULL ALTER TABLE dbo.Employees ADD PasswordHash nvarchar(512) NULL;
         IF COL_LENGTH(N'dbo.Employees', N'CollectionCountry') IS NULL ALTER TABLE dbo.Employees ADD CollectionCountry nvarchar(80) NULL;
         IF COL_LENGTH(N'dbo.Employees', N'FloatEnteredDayId') IS NULL ALTER TABLE dbo.Employees ADD FloatEnteredDayId bigint NULL;
+        IF OBJECT_ID(N'dbo.AuthSessions', N'U') IS NULL CREATE TABLE dbo.AuthSessions (Id bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_AuthSessions PRIMARY KEY, EmployeeId int NOT NULL, TokenHash nvarchar(64) NOT NULL, CreatedAtUtc datetime2 NOT NULL, ExpiresAtUtc datetime2 NOT NULL, RevokedAtUtc datetime2 NULL, CONSTRAINT FK_AuthSessions_Employees_EmployeeId FOREIGN KEY (EmployeeId) REFERENCES dbo.Employees(Id) ON DELETE CASCADE);
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.AuthSessions') AND name=N'IX_AuthSessions_TokenHash') CREATE UNIQUE INDEX IX_AuthSessions_TokenHash ON dbo.AuthSessions(TokenHash);
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.AuthSessions') AND name=N'IX_AuthSessions_EmployeeId_ExpiresAtUtc') CREATE INDEX IX_AuthSessions_EmployeeId_ExpiresAtUtc ON dbo.AuthSessions(EmployeeId, ExpiresAtUtc);
         IF OBJECT_ID(N'dbo.FloatAdjustments', N'U') IS NULL CREATE TABLE dbo.FloatAdjustments (Id bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_FloatAdjustments PRIMARY KEY, OperatingDayId bigint NOT NULL, EmployeeId int NOT NULL, ActorEmployeeId int NOT NULL, PreviousAmount decimal(18,2) NOT NULL, NewAmount decimal(18,2) NOT NULL, Reason nvarchar(500) NOT NULL, CreatedAtUtc datetime2 NOT NULL, CONSTRAINT FK_FloatAdjustments_OperatingDays_OperatingDayId FOREIGN KEY (OperatingDayId) REFERENCES dbo.OperatingDays(Id), CONSTRAINT FK_FloatAdjustments_Employees_EmployeeId FOREIGN KEY (EmployeeId) REFERENCES dbo.Employees(Id), CONSTRAINT FK_FloatAdjustments_Employees_ActorEmployeeId FOREIGN KEY (ActorEmployeeId) REFERENCES dbo.Employees(Id));
         IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.FloatAdjustments') AND name=N'IX_FloatAdjustments_OperatingDayId_EmployeeId_CreatedAtUtc') CREATE INDEX IX_FloatAdjustments_OperatingDayId_EmployeeId_CreatedAtUtc ON dbo.FloatAdjustments(OperatingDayId, EmployeeId, CreatedAtUtc);
         IF COL_LENGTH(N'dbo.Transactions', N'BranchId') IS NULL ALTER TABLE dbo.Transactions ADD BranchId int NOT NULL CONSTRAINT DF_Transactions_BranchId DEFAULT (1) WITH VALUES;
@@ -151,16 +139,13 @@ await using (var scope = app.Services.CreateAsyncScope())
     }
 }
 
-ClaimsPrincipal PrincipalFor(Employee employee) {
-    var claims = new List<Claim> {
-        new(ClaimTypes.NameIdentifier, employee.Id.ToString()),
-        new(ClaimTypes.Name, employee.Name),
-        new(ClaimTypes.Email, employee.Email),
-        new(ClaimTypes.Role, employee.Role),
-        new("branch_id", employee.BranchId.ToString())
-    };
-    if (!string.IsNullOrWhiteSpace(employee.CollectionCountry)) { claims.Add(new Claim(ClaimTypes.Role, "CollectionAgent")); claims.Add(new Claim("collection_country", employee.CollectionCountry)); }
-    return new ClaimsPrincipal(new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme));
+async Task<(string Token, DateTime ExpiresAtUtc)> CreateTabSessionAsync(Employee employee, TransferDbContext db) {
+    var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+    var expiresAtUtc = DateTime.UtcNow.AddHours(10);
+    var tokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
+    db.AuthSessions.Add(new AuthSession { EmployeeId = employee.Id, TokenHash = tokenHash, CreatedAtUtc = DateTime.UtcNow, ExpiresAtUtc = expiresAtUtc });
+    await db.SaveChangesAsync();
+    return (token, expiresAtUtc);
 }
 int EmployeeIdFor(ClaimsPrincipal user) => int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
 int BranchIdFor(ClaimsPrincipal user, int? requested) => user.IsInRole("Administrator") ? requested ?? 1 : int.Parse(user.FindFirstValue("branch_id")!);
@@ -179,17 +164,18 @@ app.MapPost("/api/auth/setup", async (SetupAdminRequest request, TransferDbConte
     var branch = await db.Branches.OrderBy(b => b.Id).FirstAsync();
     var admin = new Employee { Name = request.Name.Trim(), Email = email, Role = "Administrator", BranchId = branch.Id };
     admin.PasswordHash = hasher.HashPassword(admin, request.Password);
-    db.Employees.Add(admin); await db.SaveChangesAsync(); await transaction.CommitAsync();
-    await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, PrincipalFor(admin));
-    return Results.Created("/api/auth/me", new { admin.Id, admin.Name, admin.Email, admin.Role, admin.BranchId });
+    db.Employees.Add(admin); await db.SaveChangesAsync();
+    var session = await CreateTabSessionAsync(admin, db);
+    await transaction.CommitAsync();
+    return Results.Created("/api/auth/me", new { admin.Id, admin.Name, admin.Email, admin.Role, admin.BranchId, sessionToken = session.Token, session.ExpiresAtUtc });
 }).AllowAnonymous();
-app.MapPost("/api/auth/login", async (LoginRequest request, TransferDbContext db, PasswordHasher<Employee> hasher, HttpContext context) => {
+app.MapPost("/api/auth/login", async (LoginRequest request, TransferDbContext db, PasswordHasher<Employee> hasher) => {
     var email = request.Email.Trim().ToLowerInvariant();
     var employee = await db.Employees.SingleOrDefaultAsync(e => e.Email == email && e.IsActive);
     if (employee?.PasswordHash is null || hasher.VerifyHashedPassword(employee, employee.PasswordHash, request.Password) == PasswordVerificationResult.Failed)
         return Results.Unauthorized();
-    await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, PrincipalFor(employee), new AuthenticationProperties { IsPersistent = true, ExpiresUtc = DateTimeOffset.UtcNow.AddHours(10) });
-    return Results.Ok(new { employee.Id, employee.Name, employee.Email, employee.Role, employee.BranchId });
+    var session = await CreateTabSessionAsync(employee, db);
+    return Results.Ok(new { employee.Id, employee.Name, employee.Email, employee.Role, employee.BranchId, sessionToken = session.Token, session.ExpiresAtUtc });
 }).AllowAnonymous();
 app.MapPut("/api/auth/password", async (ChangeOwnPasswordRequest request, ClaimsPrincipal user, TransferDbContext db, PasswordHasher<Employee> hasher) => {
     if (string.IsNullOrWhiteSpace(request.NewPassword) || request.NewPassword.Length < 12) return Results.ValidationProblem(new Dictionary<string, string[]> { ["newPassword"] = ["New password must be at least 12 characters."] });
@@ -206,7 +192,13 @@ app.MapGet("/api/auth/me", async (ClaimsPrincipal user, TransferDbContext db) =>
     var employee = await db.Employees.Include(e => e.Branch).SingleOrDefaultAsync(e => e.Id == id && e.IsActive);
     return employee is null ? Results.Unauthorized() : Results.Ok(new { employee.Id, employee.Name, employee.Email, employee.Role, employee.BranchId, employee.CollectionCountry, branchName = employee.Branch!.Name, branchCity = employee.Branch.City, branchCountry = employee.Branch.Country });
 }).RequireAuthorization();
-app.MapPost("/api/auth/logout", async (HttpContext context) => { await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme); return Results.Ok(new { signedOut = true }); }).RequireAuthorization();
+app.MapPost("/api/auth/logout", async (ClaimsPrincipal user, TransferDbContext db) => {
+    if (long.TryParse(user.FindFirstValue("session_id"), out var sessionId)) {
+        var session = await db.AuthSessions.SingleOrDefaultAsync(s => s.Id == sessionId);
+        if (session is not null && session.RevokedAtUtc is null) { session.RevokedAtUtc = DateTime.UtcNow; await db.SaveChangesAsync(); }
+    }
+    return Results.Ok(new { signedOut = true });
+}).RequireAuthorization();
 
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok", service = "Shameen Investments Transfer API" })).AllowAnonymous();
 app.MapGet("/api/branches", async (TransferDbContext db, ClaimsPrincipal user) => {
