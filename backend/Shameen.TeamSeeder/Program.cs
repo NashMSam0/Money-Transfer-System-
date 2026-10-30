@@ -38,7 +38,7 @@ foreach (var sourceBranch in sourceBranches)
     var hostedBranch = hostedBranches.FirstOrDefault(b => string.Equals(b.City, sourceBranch.City, StringComparison.OrdinalIgnoreCase));
     if (hostedBranch is null)
     {
-        hostedBranch = new Branch { Name = sourceBranch.Name, City = sourceBranch.City };
+        hostedBranch = new Branch { Name = sourceBranch.Name, City = sourceBranch.City, Country = sourceBranch.Country };
         target.Branches.Add(hostedBranch);
         hostedBranches.Add(hostedBranch);
     }
@@ -46,6 +46,7 @@ foreach (var sourceBranch in sourceBranches)
     {
         hostedBranch.Name = sourceBranch.Name;
         hostedBranch.City = sourceBranch.City;
+        hostedBranch.Country = sourceBranch.Country;
     }
     branchByCity[sourceBranch.City] = hostedBranch;
 }

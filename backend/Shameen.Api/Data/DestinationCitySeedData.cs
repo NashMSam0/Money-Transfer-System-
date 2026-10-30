@@ -27,7 +27,15 @@ public static class DestinationCitySeedData
         var branchCities = await db.Branches.AsNoTracking().Select(b => b.City).ToListAsync();
         foreach (var city in Cities.Select(x => x.City).Distinct())
             if (!branchCities.Contains(city, StringComparer.OrdinalIgnoreCase))
-                db.Branches.Add(new Branch { Name = $"Shameen {city}", City = city });
+                db.Branches.Add(new Branch { Name = $"Shameen {city}", City = city, Country = Cities.First(x => x.City == city).Country });
+        await db.SaveChangesAsync();
+
+        var countryByCity = Cities.GroupBy(x => x.City, StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Select(x => x.Country).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 1)
+            .ToDictionary(group => group.Key, group => group.First().Country, StringComparer.OrdinalIgnoreCase);
+        var branches = await db.Branches.ToListAsync();
+        foreach (var branch in branches)
+            if (countryByCity.TryGetValue(branch.City, out var country)) branch.Country = country;
         await db.SaveChangesAsync();
     }
 }

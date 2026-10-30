@@ -41,6 +41,18 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
     options.ExpireTimeSpan = TimeSpan.FromHours(10); options.SlidingExpiration = true;
     options.Events.OnRedirectToLogin = context => { context.Response.StatusCode = StatusCodes.Status401Unauthorized; return Task.CompletedTask; };
     options.Events.OnRedirectToAccessDenied = context => { context.Response.StatusCode = StatusCodes.Status403Forbidden; return Task.CompletedTask; };
+    options.Events.OnValidatePrincipal = async context => {
+        var user = context.Principal;
+        if (!int.TryParse(user?.FindFirstValue(ClaimTypes.NameIdentifier), out var employeeId)) { context.RejectPrincipal(); return; }
+        var db = context.HttpContext.RequestServices.GetRequiredService<TransferDbContext>();
+        var currentBranchId = await db.Employees.AsNoTracking().Where(e => e.Id == employeeId && e.IsActive).Select(e => (int?)e.BranchId).SingleOrDefaultAsync();
+        if (currentBranchId is null) { context.RejectPrincipal(); return; }
+        if (user?.FindFirstValue("branch_id") != currentBranchId.Value.ToString()) {
+            var employee = await db.Employees.Include(e => e.Branch).SingleAsync(e => e.Id == employeeId);
+            context.ReplacePrincipal(PrincipalFor(employee));
+            context.ShouldRenew = true;
+        }
+    };
 });
 builder.Services.AddAuthorization(options => options.AddPolicy("AdminOnly", policy => policy.RequireRole("Administrator")));
 builder.Services.AddScoped<PasswordHasher<Employee>>();
@@ -65,7 +77,8 @@ await using (var scope = app.Services.CreateAsyncScope())
         await db.Database.ExecuteSqlRawAsync("""
         DECLARE @UpgradeExisting bit = CASE WHEN OBJECT_ID(N'dbo.Branches', N'U') IS NULL THEN 1 ELSE 0 END;
         IF OBJECT_ID(N'dbo.Branches', N'U') IS NULL
-            CREATE TABLE dbo.Branches (Id int IDENTITY(1,1) NOT NULL CONSTRAINT PK_Branches PRIMARY KEY, Name nvarchar(80) NOT NULL, City nvarchar(80) NOT NULL);
+            CREATE TABLE dbo.Branches (Id int IDENTITY(1,1) NOT NULL CONSTRAINT PK_Branches PRIMARY KEY, Name nvarchar(80) NOT NULL, City nvarchar(80) NOT NULL, Country nvarchar(80) NOT NULL CONSTRAINT DF_Branches_Country DEFAULT(N''));
+        IF COL_LENGTH(N'dbo.Branches', N'Country') IS NULL ALTER TABLE dbo.Branches ADD Country nvarchar(80) NOT NULL CONSTRAINT DF_Branches_Country DEFAULT(N'') WITH VALUES;
         IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.Branches') AND name=N'IX_Branches_Name') CREATE UNIQUE INDEX IX_Branches_Name ON dbo.Branches(Name);
         IF NOT EXISTS (SELECT 1 FROM dbo.Branches WHERE Id=1)
         BEGIN
@@ -191,7 +204,7 @@ app.MapPut("/api/auth/password", async (ChangeOwnPasswordRequest request, Claims
 app.MapGet("/api/auth/me", async (ClaimsPrincipal user, TransferDbContext db) => {
     var id = EmployeeIdFor(user);
     var employee = await db.Employees.Include(e => e.Branch).SingleOrDefaultAsync(e => e.Id == id && e.IsActive);
-    return employee is null ? Results.Unauthorized() : Results.Ok(new { employee.Id, employee.Name, employee.Email, employee.Role, employee.BranchId, employee.CollectionCountry, branchName = employee.Branch!.Name, branchCity = employee.Branch.City });
+    return employee is null ? Results.Unauthorized() : Results.Ok(new { employee.Id, employee.Name, employee.Email, employee.Role, employee.BranchId, employee.CollectionCountry, branchName = employee.Branch!.Name, branchCity = employee.Branch.City, branchCountry = employee.Branch.Country });
 }).RequireAuthorization();
 app.MapPost("/api/auth/logout", async (HttpContext context) => { await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme); return Results.Ok(new { signedOut = true }); }).RequireAuthorization();
 
@@ -200,6 +213,10 @@ app.MapGet("/api/branches", async (TransferDbContext db, ClaimsPrincipal user) =
     var query = db.Branches.AsQueryable();
     if (!user.IsInRole("Administrator")) { var branchId = BranchIdFor(user, null); query = query.Where(b => b.Id == branchId); }
     return Results.Ok(await query.OrderBy(b => b.Id).ToListAsync());
+}).RequireAuthorization();
+app.MapGet("/api/locations", async (TransferDbContext db, ClaimsPrincipal user) => {
+    if (!IsManager(user)) return Results.Forbid();
+    return Results.Ok(await db.Branches.AsNoTracking().Where(b => b.Country != "").OrderBy(b => b.Country).ThenBy(b => b.City).Select(b => new { b.Id, b.Name, b.City, b.Country }).ToListAsync());
 }).RequireAuthorization();
 app.MapGet("/api/day/current", async (TransferDbContext db, ClaimsPrincipal user, int? branchId) => {
     var branch = BranchIdFor(user, branchId);
@@ -228,7 +245,7 @@ app.MapGet("/api/employees", async (TransferDbContext db, ClaimsPrincipal user, 
     if (user.IsInRole("Administrator")) { if (branchId is { } requested) query = query.Where(e => e.BranchId == requested); }
     else if (user.IsInRole("Supervisor")) { var branchIdForSupervisor = BranchIdFor(user, null); query = query.Where(e => e.BranchId == branchIdForSupervisor); }
     else { var employeeId = EmployeeIdFor(user); query = query.Where(e => e.Id == employeeId); }
-    return Results.Ok(await query.OrderBy(e => e.Name).Select(e => new { e.Id, e.BranchId, e.Name, e.Email, e.Role, e.CollectionCountry, e.IsActive, e.FloatAssigned, e.FloatBalance, hasLogin = e.PasswordHash != null }).ToListAsync());
+    return Results.Ok(await query.OrderBy(e => e.Name).Select(e => new { e.Id, e.BranchId, e.Name, e.Email, e.Role, e.CollectionCountry, branchCity = e.Branch!.City, branchCountry = e.Branch.Country, e.IsActive, e.FloatAssigned, e.FloatBalance, hasLogin = e.PasswordHash != null }).ToListAsync());
 }).RequireAuthorization();
 app.MapPost("/api/employees", async (CreateEmployeeRequest request, TransferDbContext db, PasswordHasher<Employee> hasher, ClaimsPrincipal user) => {
     if (string.IsNullOrWhiteSpace(request.Name) || string.IsNullOrWhiteSpace(request.Email) || !request.Email.Contains('@'))
@@ -266,6 +283,21 @@ app.MapPut("/api/employees/{id:int}/collection-country", async (int id, AssignCo
     }
     await db.SaveChangesAsync();
     return Results.Ok(new { employee.Id, employee.CollectionCountry });
+}).RequireAuthorization();
+app.MapPut("/api/employees/{id:int}/location", async (int id, UpdateEmployeeLocationRequest request, TransferDbContext db, ClaimsPrincipal user) => {
+    var employee = await db.Employees.SingleOrDefaultAsync(e => e.Id == id);
+    if (employee is null) return Results.NotFound(new { message = "Employee not found." });
+    if (employee.Role == "Administrator" || !IsManager(user)) return Results.Forbid();
+    if (user.IsInRole("Supervisor") && (employee.BranchId != BranchIdFor(user, null) || employee.Role == "Supervisor")) return Results.Forbid();
+    var destinationBranch = await db.Branches.SingleOrDefaultAsync(b => b.Id == request.BranchId && b.Country != "");
+    if (destinationBranch is null) return Results.NotFound(new { message = "Select a configured city and country." });
+    if (employee.BranchId == destinationBranch.Id) return Results.Ok(new { employee.Id, employee.BranchId, branchName = destinationBranch.Name, branchCity = destinationBranch.City, branchCountry = destinationBranch.Country });
+    var today = DateOnly.FromDateTime(DateTime.UtcNow);
+    if (await db.OperatingDays.AnyAsync(day => (day.BranchId == employee.BranchId || day.BranchId == destinationBranch.Id) && day.Date == today && day.ClosedAtUtc == null))
+        return Results.Conflict(new { message = "Close both the current and destination city desks before changing this employee's location." });
+    employee.BranchId = destinationBranch.Id;
+    await db.SaveChangesAsync();
+    return Results.Ok(new { employee.Id, employee.BranchId, branchName = destinationBranch.Name, branchCity = destinationBranch.City, branchCountry = destinationBranch.Country });
 }).RequireAuthorization();
 app.MapPut("/api/transfers/{id:long}/destination-city", async (long id, UpdateDestinationCityRequest request, TransferDbContext db, ClaimsPrincipal user) => {
     var transfer = await db.Transactions.SingleOrDefaultAsync(t => t.Id == id);
