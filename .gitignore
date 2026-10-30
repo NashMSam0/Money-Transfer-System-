@@ -12,3 +12,4 @@ backend/**/obj/
 .env.*
 !.env.example
 backend/Shameen.Api/appsettings.Development.json
+city-supervisor-accounts.csv

@@ -80,7 +80,7 @@ if (conflictingSupervisors.Count > 0)
 var supervisorsToCreate = supervisorAccounts.Count(account => !hostedByEmail.ContainsKey(account.Email));
 Console.WriteLine($"Ready to ensure {sourceBranches.Count} branches, {teamEmployees.Count} team accounts, and {supervisorAccounts.Count} city supervisors ({accountsToCreate} team accounts and {supervisorsToCreate} supervisors new).");
 Console.WriteLine("The hosted administrator is preserved. Operating days, transfers, and float adjustments will not be changed.");
-Console.Write("Type SEED to create/update branches and team accounts only: ");
+Console.Write("Type SEED to create/update branches and team accounts and supervisors only: ");
 if (!string.Equals(Console.ReadLine(), "SEED", StringComparison.Ordinal))
 {
     Console.WriteLine("Cancelled. No hosted records were changed.");
@@ -131,8 +131,16 @@ foreach (var account in supervisorAccounts)
 
 await target.SaveChangesAsync();
 await transaction.CommitAsync();
+var supervisorCsv = new System.Text.StringBuilder("City,Name,Email\r\n");
+foreach (var account in supervisorAccounts.OrderBy(account => account.City, StringComparer.OrdinalIgnoreCase))
+    supervisorCsv.AppendLine($"{Csv(account.City)},{Csv($"City Supervisor - {account.City}")},{Csv(account.Email)}");
+var supervisorCsvPath = Path.Combine(Environment.CurrentDirectory, "city-supervisor-accounts.csv");
+await File.WriteAllTextAsync(supervisorCsvPath, supervisorCsv.ToString());
 Console.WriteLine($"Seed complete. Ensured {sourceBranches.Count} branches, {teamEmployees.Count} employee accounts, and {supervisorAccounts.Count} city supervisors. No operational history was copied.");
+Console.WriteLine($"Supervisor login list saved to {supervisorCsvPath} (email addresses only; no passwords included).");
 return 0;
+
+static string Csv(string value) => "\"" + value.Replace("\"", "\"\"") + "\"";
 
 static string ToNpgsql(string value)
 {
