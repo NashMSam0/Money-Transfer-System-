@@ -389,9 +389,11 @@ app.MapPost("/api/transfers", async (CreateTransferRequest request, TransferDbCo
     await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
     var day = DateOnly.FromDateTime(DateTime.UtcNow);
     var branchId = BranchIdFor(user, request.BranchId);
+    var isManager = IsManager(user);
+    if (!isManager && !user.IsInRole("Transfer agent") && !user.IsInRole("Senior agent")) return Results.Forbid();
+    if (isManager && !CanManageBranch(user, branchId)) return Results.Forbid();
     if (!await db.OperatingDays.AnyAsync(d => d.Date == day && d.BranchId == branchId && d.ClosedAtUtc == null)) return Results.Conflict(new { message = "Open the operating day for this branch before recording transfers." });
-    var employeeId = IsManager(user) ? request.EmployeeId : EmployeeIdFor(user);
-    if (!CanManageBranch(user, branchId)) return Results.Forbid();
+    var employeeId = isManager ? request.EmployeeId : EmployeeIdFor(user);
     var employee = await db.Employees.SingleOrDefaultAsync(e => e.Id == employeeId && e.BranchId == branchId && e.IsActive);
     if (employee is null) return Results.NotFound(new { message = "Active employee was not found." });
     if (employee.FloatBalance < request.Amount) return Results.Conflict(new { message = "Insufficient employee float.", availableFloat = employee.FloatBalance });
