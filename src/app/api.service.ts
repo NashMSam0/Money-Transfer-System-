@@ -28,8 +28,10 @@ export class ApiService {
     });
   }
   getBranchSummary(date = new Date().toISOString().slice(0, 10)) { return this.http.get<any[]>('/api/dashboard/branches?date=' + encodeURIComponent(date)); }
-  openDay(openingFloat: number, branchId: number) { return this.http.post('/api/day/open', { openingFloat, employeeId: null, branchId }); }
-  createTransfer(transfer: { employeeId: number; branchId: number; customerName: string; destinationCountry: string; destinationCity: string; amount: number; payoutMethod: string }) { return this.http.post<any>('/api/transfers', transfer); }
+  getCurrencyRates() { return this.http.get<any[]>('/api/currencies/rates'); }
+  updateCurrencyRates(rates: Array<{currencyCode:string;unitsPerUsd:number}>) { return this.http.put<any>('/api/currencies/rates', { rates }); }
+  openDay(currencyFloats: Array<{currencyCode:string;amount:number}>, branchId: number) { return this.http.post('/api/day/open', { openingFloat: currencyFloats.reduce((sum,item)=>sum+item.amount,0), currencyFloats, employeeId: null, branchId }); }
+  createTransfer(transfer: { employeeId: number; branchId: number; customerName: string; destinationCountry: string; destinationCity: string; amount: number; payoutMethod: string; sourceCurrency:string; payoutCurrency:string }) { return this.http.post<any>('/api/transfers', transfer); }
   confirmCollection(id: number, collectionReference: string) { return this.http.post<any>('/api/transfers/' + id + '/collection', { collectionReference }); }
   updateTransferDestinationCity(id: number, destinationCity: string) { return this.http.put<any>('/api/transfers/' + id + '/destination-city', { destinationCity }); }
   getCollectionQueue(date = new Date().toISOString().slice(0, 10)) { return this.http.get<any>('/api/collections?date=' + encodeURIComponent(date)); }
@@ -37,7 +39,7 @@ export class ApiService {
   setEmployeeLocation(id: number, branchId: number) { return this.http.put<any>('/api/employees/' + id + '/location', { branchId }); }
   createEmployee(employee: { name: string; email: string; role: string; branchId: number; password: string }) { return this.http.post<any>('/api/employees', employee); }
   setEmployeePassword(id: number, password: string) { return this.http.put('/api/employees/' + id + '/credentials', { password }); }
-  enterMyFloat(amount: number) { return this.http.post<any>('/api/float/my', { amount, reason: null }); }
-  adjustEmployeeFloat(id: number, amount: number, reason: string) { return this.http.put<any>('/api/employees/' + id + '/float', { amount, reason }); }
+  enterMyFloat(amount: number, currencyCode='USD') { return this.http.post<any>('/api/float/my', { amount, currencyCode, reason: null }); }
+  adjustEmployeeFloat(id: number, amount: number, reason: string, currencyCode='USD') { return this.http.put<any>('/api/employees/' + id + '/float', { amount, currencyCode, reason }); }
   closeDay(branchId: number) { return this.http.post<any>('/api/day/close', { employeeId: null, branchId }); }
 }

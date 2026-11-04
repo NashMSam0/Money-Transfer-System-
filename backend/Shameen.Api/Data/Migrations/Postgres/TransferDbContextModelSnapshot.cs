@@ -90,6 +90,32 @@ namespace Shameen.Api.Data.Migrations.Postgres
                     b.ToTable("Branches");
                 });
 
+            modelBuilder.Entity("Shameen.Api.Models.CurrencyRate", b =>
+                {
+                    b.Property<string>("CurrencyCode")
+                        .HasMaxLength(3)
+                        .HasColumnType("character varying(3)");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)");
+
+                    b.Property<decimal>("UnitsPerUsd")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<DateTime>("UpdatedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int?>("UpdatedByEmployeeId")
+                        .HasColumnType("integer");
+
+                    b.HasKey("CurrencyCode");
+
+                    b.ToTable("CurrencyRates");
+                });
+
             modelBuilder.Entity("Shameen.Api.Models.DestinationCity", b =>
                 {
                     b.Property<int>("Id")
@@ -172,6 +198,43 @@ namespace Shameen.Api.Data.Migrations.Postgres
                     b.ToTable("Employees");
                 });
 
+            modelBuilder.Entity("Shameen.Api.Models.EmployeeCurrencyFloat", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("CurrencyCode")
+                        .IsRequired()
+                        .HasMaxLength(3)
+                        .HasColumnType("character varying(3)");
+
+                    b.Property<int>("EmployeeId")
+                        .HasColumnType("integer");
+
+                    b.Property<decimal>("FloatAssigned")
+                        .HasPrecision(18, 2)
+                        .HasColumnType("numeric(18,2)");
+
+                    b.Property<decimal>("FloatBalance")
+                        .HasPrecision(18, 2)
+                        .HasColumnType("numeric(18,2)");
+
+                    b.Property<long>("OperatingDayId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("EmployeeId");
+
+                    b.HasIndex("OperatingDayId", "EmployeeId", "CurrencyCode")
+                        .IsUnique();
+
+                    b.ToTable("EmployeeCurrencyFloats");
+                });
+
             modelBuilder.Entity("Shameen.Api.Models.FloatAdjustment", b =>
                 {
                     b.Property<long>("Id")
@@ -185,6 +248,13 @@ namespace Shameen.Api.Data.Migrations.Postgres
 
                     b.Property<DateTime>("CreatedAtUtc")
                         .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("CurrencyCode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(3)
+                        .HasColumnType("character varying(3)")
+                        .HasDefaultValue("USD");
 
                     b.Property<int>("EmployeeId")
                         .HasColumnType("integer");
@@ -260,6 +330,42 @@ namespace Shameen.Api.Data.Migrations.Postgres
                     b.ToTable("OperatingDays");
                 });
 
+            modelBuilder.Entity("Shameen.Api.Models.OperatingDayCurrencyFloat", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<decimal>("BranchBalance")
+                        .HasPrecision(18, 2)
+                        .HasColumnType("numeric(18,2)");
+
+                    b.Property<decimal?>("ClosingFloat")
+                        .HasPrecision(18, 2)
+                        .HasColumnType("numeric(18,2)");
+
+                    b.Property<string>("CurrencyCode")
+                        .IsRequired()
+                        .HasMaxLength(3)
+                        .HasColumnType("character varying(3)");
+
+                    b.Property<decimal>("OpeningFloat")
+                        .HasPrecision(18, 2)
+                        .HasColumnType("numeric(18,2)");
+
+                    b.Property<long>("OperatingDayId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("OperatingDayId", "CurrencyCode")
+                        .IsUnique();
+
+                    b.ToTable("OperatingDayCurrencyFloats");
+                });
+
             modelBuilder.Entity("Shameen.Api.Models.Transfer", b =>
                 {
                     b.Property<long>("Id")
@@ -303,14 +409,44 @@ namespace Shameen.Api.Data.Migrations.Postgres
                     b.Property<int>("EmployeeId")
                         .HasColumnType("integer");
 
+                    b.Property<decimal>("ExchangeRate")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<decimal>("PayoutAmount")
+                        .HasPrecision(18, 2)
+                        .HasColumnType("numeric(18,2)");
+
+                    b.Property<string>("PayoutCurrency")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(3)
+                        .HasColumnType("character varying(3)")
+                        .HasDefaultValue("USD");
+
                     b.Property<string>("PayoutMethod")
                         .IsRequired()
                         .HasColumnType("text");
+
+                    b.Property<decimal>("PayoutUnitsPerUsd")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
 
                     b.Property<string>("Reference")
                         .IsRequired()
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)");
+
+                    b.Property<string>("SourceCurrency")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(3)
+                        .HasColumnType("character varying(3)")
+                        .HasDefaultValue("USD");
+
+                    b.Property<decimal>("SourceUnitsPerUsd")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
 
                     b.Property<string>("Status")
                         .IsRequired()
@@ -351,6 +487,21 @@ namespace Shameen.Api.Data.Migrations.Postgres
                     b.Navigation("Branch");
                 });
 
+            modelBuilder.Entity("Shameen.Api.Models.EmployeeCurrencyFloat", b =>
+                {
+                    b.HasOne("Shameen.Api.Models.Employee", null)
+                        .WithMany()
+                        .HasForeignKey("EmployeeId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("Shameen.Api.Models.OperatingDay", null)
+                        .WithMany()
+                        .HasForeignKey("OperatingDayId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
             modelBuilder.Entity("Shameen.Api.Models.FloatAdjustment", b =>
                 {
                     b.HasOne("Shameen.Api.Models.Employee", null)
@@ -381,6 +532,15 @@ namespace Shameen.Api.Data.Migrations.Postgres
                         .IsRequired();
 
                     b.Navigation("Branch");
+                });
+
+            modelBuilder.Entity("Shameen.Api.Models.OperatingDayCurrencyFloat", b =>
+                {
+                    b.HasOne("Shameen.Api.Models.OperatingDay", null)
+                        .WithMany()
+                        .HasForeignKey("OperatingDayId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
                 });
 
             modelBuilder.Entity("Shameen.Api.Models.Transfer", b =>

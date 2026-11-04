@@ -50,6 +50,8 @@ app.UseAuthorization();
 app.UseSwagger();
 app.UseSwaggerUI(options => options.SwaggerEndpoint("/swagger/v1/swagger.json", "Shameen Transfer API v1"));
 var supportedCollectionCountries = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Kenya", "Zambia", "Zimbabwe", "South Africa", "Tanzania", "Uganda", "United Kingdom" };
+var supportedCurrencyNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["USD"] = "US Dollar", ["ZMW"] = "Zambian Kwacha", ["ZAR"] = "South African Rand", ["TZS"] = "Tanzanian Shilling", ["ZWG"] = "Zimbabwe Gold", ["KES"] = "Kenyan Shilling", ["UGX"] = "Ugandan Shilling", ["GBP"] = "British Pound" };
+string NormalizeCurrency(string? code) => (code ?? "").Trim().ToUpperInvariant();
 
 await using (var scope = app.Services.CreateAsyncScope())
 {
@@ -93,6 +95,25 @@ await using (var scope = app.Services.CreateAsyncScope())
         IF COL_LENGTH(N'dbo.Transactions', N'CollectionConfirmedByEmployeeId') IS NULL ALTER TABLE dbo.Transactions ADD CollectionConfirmedByEmployeeId int NULL;
         IF COL_LENGTH(N'dbo.Transactions', N'CollectionReference') IS NULL ALTER TABLE dbo.Transactions ADD CollectionReference nvarchar(120) NULL;
         IF COL_LENGTH(N'dbo.Transactions', N'DestinationCity') IS NULL ALTER TABLE dbo.Transactions ADD DestinationCity nvarchar(100) NULL;
+        IF COL_LENGTH(N'dbo.Transactions', N'SourceCurrency') IS NULL ALTER TABLE dbo.Transactions ADD SourceCurrency nvarchar(3) NOT NULL CONSTRAINT DF_Transactions_SourceCurrency DEFAULT(N'USD') WITH VALUES;
+        IF COL_LENGTH(N'dbo.Transactions', N'PayoutCurrency') IS NULL ALTER TABLE dbo.Transactions ADD PayoutCurrency nvarchar(3) NOT NULL CONSTRAINT DF_Transactions_PayoutCurrency DEFAULT(N'USD') WITH VALUES;
+        IF COL_LENGTH(N'dbo.Transactions', N'PayoutAmount') IS NULL ALTER TABLE dbo.Transactions ADD PayoutAmount decimal(18,2) NOT NULL CONSTRAINT DF_Transactions_PayoutAmount DEFAULT(0) WITH VALUES;
+        IF COL_LENGTH(N'dbo.Transactions', N'ExchangeRate') IS NULL ALTER TABLE dbo.Transactions ADD ExchangeRate decimal(18,8) NOT NULL CONSTRAINT DF_Transactions_ExchangeRate DEFAULT(1) WITH VALUES;
+        IF COL_LENGTH(N'dbo.Transactions', N'SourceUnitsPerUsd') IS NULL ALTER TABLE dbo.Transactions ADD SourceUnitsPerUsd decimal(18,8) NOT NULL CONSTRAINT DF_Transactions_SourceUnitsPerUsd DEFAULT(1) WITH VALUES;
+        IF COL_LENGTH(N'dbo.Transactions', N'PayoutUnitsPerUsd') IS NULL ALTER TABLE dbo.Transactions ADD PayoutUnitsPerUsd decimal(18,8) NOT NULL CONSTRAINT DF_Transactions_PayoutUnitsPerUsd DEFAULT(1) WITH VALUES;
+        UPDATE dbo.Transactions SET PayoutAmount=Amount WHERE PayoutAmount=0;
+        IF COL_LENGTH(N'dbo.FloatAdjustments', N'CurrencyCode') IS NULL ALTER TABLE dbo.FloatAdjustments ADD CurrencyCode nvarchar(3) NOT NULL CONSTRAINT DF_FloatAdjustments_CurrencyCode DEFAULT(N'USD') WITH VALUES;
+        IF OBJECT_ID(N'dbo.CurrencyRates', N'U') IS NULL CREATE TABLE dbo.CurrencyRates (CurrencyCode nvarchar(3) NOT NULL CONSTRAINT PK_CurrencyRates PRIMARY KEY, Name nvarchar(80) NOT NULL, UnitsPerUsd decimal(18,8) NOT NULL, UpdatedAtUtc datetime2 NOT NULL, UpdatedByEmployeeId int NULL);
+        IF OBJECT_ID(N'dbo.OperatingDayCurrencyFloats', N'U') IS NULL CREATE TABLE dbo.OperatingDayCurrencyFloats (Id bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_OperatingDayCurrencyFloats PRIMARY KEY, OperatingDayId bigint NOT NULL, CurrencyCode nvarchar(3) NOT NULL, OpeningFloat decimal(18,2) NOT NULL, BranchBalance decimal(18,2) NOT NULL, ClosingFloat decimal(18,2) NULL, CONSTRAINT FK_OperatingDayCurrencyFloats_OperatingDays FOREIGN KEY (OperatingDayId) REFERENCES dbo.OperatingDays(Id) ON DELETE CASCADE);
+        IF OBJECT_ID(N'dbo.EmployeeCurrencyFloats', N'U') IS NULL CREATE TABLE dbo.EmployeeCurrencyFloats (Id bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_EmployeeCurrencyFloats PRIMARY KEY, OperatingDayId bigint NOT NULL, EmployeeId int NOT NULL, CurrencyCode nvarchar(3) NOT NULL, FloatAssigned decimal(18,2) NOT NULL, FloatBalance decimal(18,2) NOT NULL, CONSTRAINT FK_EmployeeCurrencyFloats_OperatingDays FOREIGN KEY (OperatingDayId) REFERENCES dbo.OperatingDays(Id), CONSTRAINT FK_EmployeeCurrencyFloats_Employees FOREIGN KEY (EmployeeId) REFERENCES dbo.Employees(Id));
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.OperatingDayCurrencyFloats') AND name=N'IX_OperatingDayCurrencyFloats_OperatingDayId_CurrencyCode') CREATE UNIQUE INDEX IX_OperatingDayCurrencyFloats_OperatingDayId_CurrencyCode ON dbo.OperatingDayCurrencyFloats(OperatingDayId, CurrencyCode);
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.EmployeeCurrencyFloats') AND name=N'IX_EmployeeCurrencyFloats_OperatingDayId_EmployeeId_CurrencyCode') CREATE UNIQUE INDEX IX_EmployeeCurrencyFloats_OperatingDayId_EmployeeId_CurrencyCode ON dbo.EmployeeCurrencyFloats(OperatingDayId, EmployeeId, CurrencyCode);
+        INSERT dbo.CurrencyRates (CurrencyCode, Name, UnitsPerUsd, UpdatedAtUtc) SELECT N'USD', N'US Dollar', 1, SYSUTCDATETIME() WHERE NOT EXISTS (SELECT 1 FROM dbo.CurrencyRates WHERE CurrencyCode=N'USD');
+        INSERT dbo.OperatingDayCurrencyFloats (OperatingDayId, CurrencyCode, OpeningFloat, BranchBalance)
+        SELECT day.Id, N'USD', day.OpeningFloat, CASE WHEN day.OpeningFloat - ISNULL((SELECT SUM(employee.FloatAssigned) FROM dbo.Employees employee WHERE employee.FloatEnteredDayId=day.Id), 0) < 0 THEN 0 ELSE day.OpeningFloat - ISNULL((SELECT SUM(employee.FloatAssigned) FROM dbo.Employees employee WHERE employee.FloatEnteredDayId=day.Id), 0) END
+        FROM dbo.OperatingDays day WHERE NOT EXISTS (SELECT 1 FROM dbo.OperatingDayCurrencyFloats currentFloat WHERE currentFloat.OperatingDayId=day.Id AND currentFloat.CurrencyCode=N'USD');
+        INSERT dbo.EmployeeCurrencyFloats (OperatingDayId, EmployeeId, CurrencyCode, FloatAssigned, FloatBalance)
+        SELECT employee.FloatEnteredDayId, employee.Id, N'USD', employee.FloatAssigned, employee.FloatBalance FROM dbo.Employees employee WHERE employee.FloatEnteredDayId IS NOT NULL AND NOT EXISTS (SELECT 1 FROM dbo.EmployeeCurrencyFloats currentFloat WHERE currentFloat.OperatingDayId=employee.FloatEnteredDayId AND currentFloat.EmployeeId=employee.Id AND currentFloat.CurrencyCode=N'USD');
         IF OBJECT_ID(N'dbo.DestinationCities', N'U') IS NULL CREATE TABLE dbo.DestinationCities (Id int IDENTITY(1,1) NOT NULL CONSTRAINT PK_DestinationCities PRIMARY KEY, Country nvarchar(80) NOT NULL, City nvarchar(100) NOT NULL);
         IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.DestinationCities') AND name=N'IX_DestinationCities_Country_City') CREATE UNIQUE INDEX IX_DestinationCities_Country_City ON dbo.DestinationCities(Country, City);
         INSERT INTO dbo.DestinationCities (Country, City)
@@ -192,6 +213,33 @@ app.MapGet("/api/auth/me", async (ClaimsPrincipal user, TransferDbContext db) =>
     var employee = await db.Employees.Include(e => e.Branch).SingleOrDefaultAsync(e => e.Id == id && e.IsActive);
     return employee is null ? Results.Unauthorized() : Results.Ok(new { employee.Id, employee.Name, employee.Email, employee.Role, employee.BranchId, employee.CollectionCountry, branchName = employee.Branch!.Name, branchCity = employee.Branch.City, branchCountry = employee.Branch.Country });
 }).RequireAuthorization();
+app.MapGet("/api/currencies/rates", async (TransferDbContext db, ClaimsPrincipal user) => {
+    if (!IsManager(user)) return Results.Forbid();
+    var configured = await db.CurrencyRates.AsNoTracking().ToListAsync();
+    return Results.Ok(supportedCurrencyNames.Select(item => {
+        var rate = configured.FirstOrDefault(rate => rate.CurrencyCode == item.Key);
+        return new { currencyCode = item.Key, name = item.Value, unitsPerUsd = rate?.UnitsPerUsd ?? (item.Key == "USD" ? 1m : 0m), updatedAtUtc = rate?.UpdatedAtUtc };
+    }));
+}).RequireAuthorization();
+app.MapPut("/api/currencies/rates", async (UpdateCurrencyRatesRequest request, TransferDbContext db, ClaimsPrincipal user) => {
+    if (!user.IsInRole("Administrator")) return Results.Forbid();
+    if (request.Rates is null || request.Rates.Count == 0) return Results.ValidationProblem(new Dictionary<string, string[]> { ["rates"] = ["Enter at least one exchange rate."] });
+    foreach (var rate in request.Rates) {
+        var code = NormalizeCurrency(rate.CurrencyCode);
+        if (!supportedCurrencyNames.ContainsKey(code)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["currencyCode"] = [$"{code} is not a supported currency."] });
+        if (rate.UnitsPerUsd < 0 || rate.UnitsPerUsd > 1000000000m || decimal.Round(rate.UnitsPerUsd, 8) != rate.UnitsPerUsd) return Results.ValidationProblem(new Dictionary<string, string[]> { ["unitsPerUsd"] = [$"Enter zero to disable {code}, or a positive rate with up to 8 decimal places."] });
+        if (code == "USD" && rate.UnitsPerUsd != 1m) return Results.ValidationProblem(new Dictionary<string, string[]> { ["unitsPerUsd"] = ["The USD base rate must remain 1.00000000."] });
+    }
+    var now = DateTime.UtcNow; var actor = EmployeeIdFor(user);
+    foreach (var input in request.Rates) {
+        var code = NormalizeCurrency(input.CurrencyCode);
+        var row = await db.CurrencyRates.SingleOrDefaultAsync(rate => rate.CurrencyCode == code);
+        if (row is null) { row = new CurrencyRate { CurrencyCode = code, Name = supportedCurrencyNames[code] }; db.CurrencyRates.Add(row); }
+        row.UnitsPerUsd = input.UnitsPerUsd; row.UpdatedAtUtc = now; row.UpdatedByEmployeeId = actor;
+    }
+    await db.SaveChangesAsync();
+    return Results.Ok(new { updatedAtUtc = now, rates = await db.CurrencyRates.AsNoTracking().OrderBy(rate => rate.CurrencyCode).ToListAsync() });
+}).RequireAuthorization();
 app.MapPost("/api/auth/logout", async (ClaimsPrincipal user, TransferDbContext db) => {
     if (long.TryParse(user.FindFirstValue("session_id"), out var sessionId)) {
         var session = await db.AuthSessions.SingleOrDefaultAsync(s => s.Id == sessionId);
@@ -214,7 +262,8 @@ app.MapGet("/api/day/current", async (TransferDbContext db, ClaimsPrincipal user
     var branch = BranchIdFor(user, branchId);
     var day = DateOnly.FromDateTime(DateTime.UtcNow);
     var operatingDay = await db.OperatingDays.SingleOrDefaultAsync(d => d.Date == day && d.BranchId == branch);
-    return Results.Ok(new { isOpen = operatingDay is { ClosedAtUtc: null }, operatingDay });
+    var currencyFloats = operatingDay is null ? new List<OperatingDayCurrencyFloat>() : await db.OperatingDayCurrencyFloats.AsNoTracking().Where(f => f.OperatingDayId == operatingDay.Id).OrderBy(f => f.CurrencyCode).ToListAsync();
+    return Results.Ok(new { isOpen = operatingDay is { ClosedAtUtc: null }, operatingDay, currencyFloats });
 }).RequireAuthorization();
 app.MapGet("/api/dashboard", async (TransferDbContext db, ClaimsPrincipal user, DateOnly? date, int? branchId) => {
     var branch = BranchIdFor(user, branchId);
@@ -240,14 +289,18 @@ app.MapGet("/api/dashboard/branches", async (TransferDbContext db, ClaimsPrincip
     var branches = await db.Branches.AsNoTracking().OrderBy(b => b.Country).ThenBy(b => b.City).Select(b => new { b.Id, b.Name, b.City, b.Country }).ToListAsync();
     var employeeStats = await db.Employees.AsNoTracking().Where(e => e.IsActive && e.Role != "Administrator").GroupBy(e => e.BranchId).Select(group => new { BranchId = group.Key, ActiveAgents = group.Count(), AssignedFloat = group.Sum(e => e.FloatAssigned), AgentFloat = group.Sum(e => e.FloatBalance) }).ToListAsync();
     var transferStats = await db.Transactions.AsNoTracking().Where(t => t.CreatedAtUtc >= startOfDayUtc && t.CreatedAtUtc < startOfNextDayUtc).GroupBy(t => t.BranchId).Select(group => new { BranchId = group.Key, TransferCount = group.Count(), TotalSent = group.Sum(t => t.Amount), CollectedCount = group.Count(t => t.Status == "Collected" || t.Status == "Completed"), AwaitingCount = group.Count(t => t.Status == "Awaiting collection") }).ToListAsync();
-    var operatingDays = await db.OperatingDays.AsNoTracking().Where(d => d.Date == day).Select(d => new { d.BranchId, d.OpeningFloat, d.ClosedAtUtc }).ToListAsync();
+    var operatingDays = await db.OperatingDays.AsNoTracking().Where(d => d.Date == day).Select(d => new { d.Id, d.BranchId, d.OpeningFloat, d.ClosedAtUtc }).ToListAsync();
+    var operatingDayIds = operatingDays.Select(item => item.Id).ToArray();
+    var dayCurrencies = operatingDayIds.Length == 0 ? new List<OperatingDayCurrencyFloat>() : await db.OperatingDayCurrencyFloats.AsNoTracking().Where(item => operatingDayIds.Contains(item.OperatingDayId)).ToListAsync();
+    var employeeCurrencies = operatingDayIds.Length == 0 ? new List<EmployeeCurrencyFloat>() : await db.EmployeeCurrencyFloats.AsNoTracking().Where(item => operatingDayIds.Contains(item.OperatingDayId)).ToListAsync();
     return Results.Ok(branches.Select(branch => {
         var agents = employeeStats.FirstOrDefault(item => item.BranchId == branch.Id);
         var transfers = transferStats.FirstOrDefault(item => item.BranchId == branch.Id);
         var operatingDay = operatingDays.FirstOrDefault(item => item.BranchId == branch.Id);
         var isOpen = operatingDay is { ClosedAtUtc: null };
         var unassignedFloat = isOpen ? Math.Max(0, operatingDay!.OpeningFloat - (agents?.AssignedFloat ?? 0)) : 0;
-        return new { branch.Id, branch.Name, branch.City, branch.Country, ActiveAgents = agents?.ActiveAgents ?? 0, AssignedFloat = agents?.AssignedFloat ?? 0, AvailableFloat = (agents?.AgentFloat ?? 0) + unassignedFloat, TransferCount = transfers?.TransferCount ?? 0, TotalSent = transfers?.TotalSent ?? 0, CollectedCount = transfers?.CollectedCount ?? 0, AwaitingCount = transfers?.AwaitingCount ?? 0, OpeningFloat = operatingDay?.OpeningFloat ?? 0, IsOpen = isOpen };
+        var branchCurrencyFloats = dayCurrencies.Where(item => item.OperatingDayId == operatingDay?.Id).Select(item => new { item.CurrencyCode, amount = item.BranchBalance + employeeCurrencies.Where(wallet => wallet.OperatingDayId == item.OperatingDayId && wallet.CurrencyCode == item.CurrencyCode).Sum(wallet => wallet.FloatBalance) }).ToList();
+        return new { branch.Id, branch.Name, branch.City, branch.Country, ActiveAgents = agents?.ActiveAgents ?? 0, AssignedFloat = agents?.AssignedFloat ?? 0, AvailableFloat = (agents?.AgentFloat ?? 0) + unassignedFloat, currencyBalances = branchCurrencyFloats, TransferCount = transfers?.TransferCount ?? 0, TotalSent = transfers?.TotalSent ?? 0, CollectedCount = transfers?.CollectedCount ?? 0, AwaitingCount = transfers?.AwaitingCount ?? 0, OpeningFloat = operatingDay?.OpeningFloat ?? 0, IsOpen = isOpen };
     }));
 }).RequireAuthorization();
 app.MapGet("/api/employees", async (TransferDbContext db, ClaimsPrincipal user, int? branchId) => {
@@ -255,7 +308,12 @@ app.MapGet("/api/employees", async (TransferDbContext db, ClaimsPrincipal user, 
     if (user.IsInRole("Administrator")) { if (branchId is { } requested) query = query.Where(e => e.BranchId == requested); }
     else if (user.IsInRole("Supervisor")) { var branchIdForSupervisor = BranchIdFor(user, null); query = query.Where(e => e.BranchId == branchIdForSupervisor); }
     else { var employeeId = EmployeeIdFor(user); query = query.Where(e => e.Id == employeeId); }
-    return Results.Ok(await query.OrderBy(e => e.Name).Select(e => new { e.Id, e.BranchId, e.Name, e.Email, e.Role, e.CollectionCountry, branchCity = e.Branch!.City, branchCountry = e.Branch.Country, e.IsActive, e.FloatAssigned, e.FloatBalance, hasLogin = e.PasswordHash != null }).ToListAsync());
+    var employees = await query.OrderBy(e => e.Name).Select(e => new { e.Id, e.BranchId, e.Name, e.Email, e.Role, e.CollectionCountry, branchCity = e.Branch!.City, branchCountry = e.Branch.Country, e.IsActive, e.FloatAssigned, e.FloatBalance, hasLogin = e.PasswordHash != null }).ToListAsync();
+    var today = DateOnly.FromDateTime(DateTime.UtcNow);
+    var branchIds = employees.Select(employee => employee.BranchId).Distinct().ToArray(); var employeeIds = employees.Select(employee => employee.Id).ToArray();
+    var operatingDayIds = await db.OperatingDays.AsNoTracking().Where(day => day.Date == today && branchIds.Contains(day.BranchId)).Select(day => day.Id).ToListAsync();
+    var balances = operatingDayIds.Count == 0 ? new List<EmployeeCurrencyFloat>() : await db.EmployeeCurrencyFloats.AsNoTracking().Where(balance => operatingDayIds.Contains(balance.OperatingDayId) && employeeIds.Contains(balance.EmployeeId)).OrderBy(balance => balance.CurrencyCode).ToListAsync();
+    return Results.Ok(employees.Select(employee => new { employee.Id, employee.BranchId, employee.Name, employee.Email, employee.Role, employee.CollectionCountry, employee.branchCity, employee.branchCountry, employee.IsActive, employee.FloatAssigned, employee.FloatBalance, employee.hasLogin, currencyFloats = balances.Where(balance => balance.EmployeeId == employee.Id).Select(balance => new { balance.CurrencyCode, balance.FloatAssigned, balance.FloatBalance }) }));
 }).RequireAuthorization();
 app.MapPost("/api/employees", async (CreateEmployeeRequest request, TransferDbContext db, PasswordHasher<Employee> hasher, ClaimsPrincipal user) => {
     if (string.IsNullOrWhiteSpace(request.Name) || string.IsNullOrWhiteSpace(request.Email) || !request.Email.Contains('@'))
@@ -337,42 +395,56 @@ app.MapGet("/api/transfers", async (TransferDbContext db, ClaimsPrincipal user, 
         var startOfNextDayUtc = DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
         query = query.Where(t => t.CreatedAtUtc >= startOfDayUtc && t.CreatedAtUtc < startOfNextDayUtc);
     }
-    return Results.Ok(await query.OrderByDescending(t => t.CreatedAtUtc).Take(500).Select(t => new { t.Id, t.Reference, t.CustomerName, t.DestinationCountry, t.DestinationCity, t.Amount, t.PayoutMethod, t.Status, t.CreatedAtUtc, t.EmployeeId, t.BranchId, t.CollectedAtUtc, t.CollectionReference, t.CollectionConfirmedByEmployeeId, sendingAgent = t.Employee!.Name, sourceBranch = t.Branch!.Name }).ToListAsync());
+    return Results.Ok(await query.OrderByDescending(t => t.CreatedAtUtc).Take(500).Select(t => new { t.Id, t.Reference, t.CustomerName, t.DestinationCountry, t.DestinationCity, t.Amount, t.SourceCurrency, t.PayoutCurrency, t.PayoutAmount, t.ExchangeRate, t.SourceUnitsPerUsd, t.PayoutUnitsPerUsd, t.PayoutMethod, t.Status, t.CreatedAtUtc, t.EmployeeId, t.BranchId, t.CollectedAtUtc, t.CollectionReference, t.CollectionConfirmedByEmployeeId, sendingAgent = t.Employee!.Name, sourceBranch = t.Branch!.Name }).ToListAsync());
 }).RequireAuthorization();
 app.MapPost("/api/day/open", async (OpenDayRequest request, TransferDbContext db, ClaimsPrincipal user) => {
-    if (request.OpeningFloat <= 0) return Results.ValidationProblem(new Dictionary<string, string[]> { ["openingFloat"] = ["Opening float must be greater than zero."] });
     var branchId = BranchIdFor(user, request.BranchId);
     if (!CanManageBranch(user, branchId)) return Results.Forbid();
     if (!await db.Branches.AnyAsync(b => b.Id == branchId)) return Results.NotFound(new { message = "The selected transfer branch was not found." });
+    var requestedFloats = request.CurrencyFloats ?? [new CurrencyAmountRequest("USD", request.OpeningFloat)];
+    if (requestedFloats.Any(item => item.Amount < 0 || decimal.Round(item.Amount, 2) != item.Amount)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["currencyFloats"] = ["Float amounts must be zero or positive with no more than two decimal places."] });
+    var openingFloats = requestedFloats.Where(item => item.Amount > 0).ToList();
+    if (openingFloats.Count == 0) return Results.ValidationProblem(new Dictionary<string, string[]> { ["openingFloat"] = ["Enter an opening float in at least one currency."] });
+    if (openingFloats.Any(item => !supportedCurrencyNames.ContainsKey(NormalizeCurrency(item.CurrencyCode)) || item.Amount < 0 || decimal.Round(item.Amount, 2) != item.Amount)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["currencyFloats"] = ["Use supported currencies and amounts with no more than two decimal places."] });
+    if (openingFloats.Select(item => NormalizeCurrency(item.CurrencyCode)).Distinct(StringComparer.OrdinalIgnoreCase).Count() != openingFloats.Count) return Results.ValidationProblem(new Dictionary<string, string[]> { ["currencyFloats"] = ["Each currency can only be entered once."] });
     var day = DateOnly.FromDateTime(DateTime.UtcNow);
     if (await db.OperatingDays.AnyAsync(d => d.Date == day && d.BranchId == branchId && d.ClosedAtUtc == null)) return Results.Conflict(new { message = "An operating day is already open for this branch." });
-    var record = new OperatingDay { BranchId = branchId, Date = day, OpeningFloat = request.OpeningFloat, OpenedAtUtc = DateTime.UtcNow, OpenedByEmployeeId = EmployeeIdFor(user) };
+    var record = new OperatingDay { BranchId = branchId, Date = day, OpeningFloat = openingFloats.Sum(item => item.Amount), OpenedAtUtc = DateTime.UtcNow, OpenedByEmployeeId = EmployeeIdFor(user) };
     var employees = await db.Employees.Where(e => e.BranchId == branchId && e.IsActive && e.Role != "Administrator").OrderBy(e => e.Id).ToListAsync();
     if (employees.Count == 0) return Results.Conflict(new { message = "Add an active employee before opening the day." });
     foreach (var employee in employees) { employee.FloatAssigned = 0; employee.FloatBalance = 0; employee.FloatEnteredDayId = null; }
-    db.OperatingDays.Add(record); await db.SaveChangesAsync(); return Results.Created($"/api/day/{record.Id}", record);
+    db.OperatingDays.Add(record); await db.SaveChangesAsync();
+    foreach (var item in openingFloats) { var code = NormalizeCurrency(item.CurrencyCode); db.OperatingDayCurrencyFloats.Add(new OperatingDayCurrencyFloat { OperatingDayId = record.Id, CurrencyCode = code, OpeningFloat = item.Amount, BranchBalance = item.Amount }); }
+    await db.SaveChangesAsync(); return Results.Created($"/api/day/{record.Id}", new { record.Id, record.Date, currencyFloats = openingFloats });
 }).RequireAuthorization();
 app.MapPost("/api/float/my", async (SetFloatRequest request, TransferDbContext db, ClaimsPrincipal user) => {
     if (user.IsInRole("Administrator")) return Results.Forbid();
     if (request.Amount <= 0 || decimal.Round(request.Amount, 2) != request.Amount) return Results.ValidationProblem(new Dictionary<string, string[]> { ["amount"] = ["Enter a float greater than zero with no more than two decimal places."] });
+    var currencyCode = NormalizeCurrency(request.CurrencyCode);
+    if (!supportedCurrencyNames.ContainsKey(currencyCode)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["currencyCode"] = ["Select a supported float currency."] });
     await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
     var employeeId = EmployeeIdFor(user); var branchId = BranchIdFor(user, null); var today = DateOnly.FromDateTime(DateTime.UtcNow);
     var operatingDay = await db.OperatingDays.SingleOrDefaultAsync(d => d.Date == today && d.BranchId == branchId && d.ClosedAtUtc == null);
     if (operatingDay is null) return Results.Conflict(new { message = "The administrator must open this branch's day before you can enter float." });
     var employee = await db.Employees.SingleOrDefaultAsync(e => e.Id == employeeId && e.BranchId == branchId && e.IsActive && e.Role != "Administrator");
     if (employee is null) return Results.NotFound(new { message = "Your active employee account was not found." });
-    if (employee.FloatEnteredDayId == operatingDay.Id) return Results.Conflict(new { message = "Your float is already recorded for today. Only an administrator can change it." });
-    var assignedElsewhere = await db.Employees.Where(e => e.BranchId == branchId && e.IsActive && e.Role != "Administrator" && e.Id != employeeId).SumAsync(e => e.FloatAssigned);
-    var remaining = operatingDay.OpeningFloat - assignedElsewhere;
-    if (request.Amount > remaining) return Results.Conflict(new { message = $"Float exceeds the unassigned branch reserve of {Math.Max(0, remaining):0.00}. Ask an administrator to increase the opening float." });
-    employee.FloatAssigned = employee.FloatBalance = request.Amount; employee.FloatEnteredDayId = operatingDay.Id;
-    db.FloatAdjustments.Add(new FloatAdjustment { OperatingDayId = operatingDay.Id, EmployeeId = employee.Id, ActorEmployeeId = employee.Id, PreviousAmount = 0, NewAmount = request.Amount, Reason = "Employee opening float entry", CreatedAtUtc = DateTime.UtcNow });
+    var branchFloat = await db.OperatingDayCurrencyFloats.SingleOrDefaultAsync(item => item.OperatingDayId == operatingDay.Id && item.CurrencyCode == currencyCode);
+    if (branchFloat is null) return Results.Conflict(new { message = $"The administrator did not open a {currencyCode} float for this branch today." });
+    if (await db.EmployeeCurrencyFloats.AnyAsync(item => item.OperatingDayId == operatingDay.Id && item.EmployeeId == employee.Id && item.CurrencyCode == currencyCode)) return Results.Conflict(new { message = $"Your {currencyCode} float is already recorded for today. Only an administrator can change it." });
+    if (request.Amount > branchFloat.BranchBalance) return Results.Conflict(new { message = $"Float exceeds the branch's available {currencyCode} reserve ({branchFloat.BranchBalance:0.00} {currencyCode})." });
+    branchFloat.BranchBalance -= request.Amount;
+    db.EmployeeCurrencyFloats.Add(new EmployeeCurrencyFloat { OperatingDayId = operatingDay.Id, EmployeeId = employee.Id, CurrencyCode = currencyCode, FloatAssigned = request.Amount, FloatBalance = request.Amount });
+    employee.FloatEnteredDayId = operatingDay.Id;
+    if (currencyCode == "USD") employee.FloatAssigned = employee.FloatBalance = request.Amount;
+    db.FloatAdjustments.Add(new FloatAdjustment { OperatingDayId = operatingDay.Id, EmployeeId = employee.Id, ActorEmployeeId = employee.Id, PreviousAmount = 0, NewAmount = request.Amount, CurrencyCode = currencyCode, Reason = "Employee opening float entry", CreatedAtUtc = DateTime.UtcNow });
     await db.SaveChangesAsync(); await tx.CommitAsync();
-    return Results.Ok(new { employee.Id, employee.FloatAssigned, employee.FloatBalance, locked = true });
+    return Results.Ok(new { employee.Id, currencyCode, amount = request.Amount, remainingBranchReserve = branchFloat.BranchBalance, locked = true });
 }).RequireAuthorization();
 app.MapPut("/api/employees/{id:int}/float", async (int id, SetFloatRequest request, TransferDbContext db, ClaimsPrincipal user) => {
     if (request.Amount < 0 || decimal.Round(request.Amount, 2) != request.Amount) return Results.ValidationProblem(new Dictionary<string, string[]> { ["amount"] = ["Enter zero or a positive float with no more than two decimal places."] });
     if (string.IsNullOrWhiteSpace(request.Reason)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["reason"] = ["Enter a reason for the float correction."] });
+    var currencyCode = NormalizeCurrency(request.CurrencyCode);
+    if (!supportedCurrencyNames.ContainsKey(currencyCode)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["currencyCode"] = ["Select a supported float currency."] });
     await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
     var employee = await db.Employees.SingleOrDefaultAsync(e => e.Id == id && e.Role != "Administrator");
     if (employee is null) return Results.NotFound(new { message = "Employee not found." });
@@ -380,16 +452,23 @@ app.MapPut("/api/employees/{id:int}/float", async (int id, SetFloatRequest reque
     var today = DateOnly.FromDateTime(DateTime.UtcNow);
     var operatingDay = await db.OperatingDays.SingleOrDefaultAsync(d => d.Date == today && d.BranchId == employee.BranchId && d.ClosedAtUtc == null);
     if (operatingDay is null) return Results.Conflict(new { message = "Open the operating day before adjusting employee float." });
-    var assignedToOthers = await db.Employees.Where(e => e.BranchId == employee.BranchId && e.IsActive && e.Role != "Administrator" && e.Id != id).SumAsync(e => e.FloatAssigned);
-    var remainingForEmployee = operatingDay.OpeningFloat - assignedToOthers;
-    if (request.Amount > remainingForEmployee) return Results.Conflict(new { message = $"Float exceeds the branch reserve available for this employee ({Math.Max(0, remainingForEmployee):0.00})." });
-    var updatedBalance = employee.FloatBalance + request.Amount - employee.FloatAssigned;
+    var branchFloat = await db.OperatingDayCurrencyFloats.SingleOrDefaultAsync(item => item.OperatingDayId == operatingDay.Id && item.CurrencyCode == currencyCode);
+    if (branchFloat is null) return Results.Conflict(new { message = $"No {currencyCode} branch reserve was opened for today." });
+    var wallet = await db.EmployeeCurrencyFloats.SingleOrDefaultAsync(item => item.OperatingDayId == operatingDay.Id && item.EmployeeId == id && item.CurrencyCode == currencyCode);
+    var previousAmount = wallet?.FloatAssigned ?? 0m;
+    var delta = request.Amount - previousAmount;
+    if (delta > branchFloat.BranchBalance) return Results.Conflict(new { message = $"Float exceeds the available {currencyCode} branch reserve ({branchFloat.BranchBalance:0.00} {currencyCode})." });
+    var currentBalance = wallet?.FloatBalance ?? 0m;
+    var updatedBalance = currentBalance + delta;
     if (updatedBalance < 0) return Results.Conflict(new { message = "This correction would put the employee float below zero because transfers have already been paid. Increase the float or reconcile those transfers first." });
-    var previousAmount = employee.FloatAssigned;
-    employee.FloatAssigned = request.Amount; employee.FloatBalance = updatedBalance; employee.FloatEnteredDayId = operatingDay.Id;
-    db.FloatAdjustments.Add(new FloatAdjustment { OperatingDayId = operatingDay.Id, EmployeeId = employee.Id, ActorEmployeeId = EmployeeIdFor(user), PreviousAmount = previousAmount, NewAmount = request.Amount, Reason = request.Reason.Trim(), CreatedAtUtc = DateTime.UtcNow });
+    branchFloat.BranchBalance -= delta;
+    if (wallet is null) { wallet = new EmployeeCurrencyFloat { OperatingDayId = operatingDay.Id, EmployeeId = id, CurrencyCode = currencyCode }; db.EmployeeCurrencyFloats.Add(wallet); }
+    wallet.FloatAssigned = request.Amount; wallet.FloatBalance = updatedBalance;
+    employee.FloatEnteredDayId = operatingDay.Id;
+    if (currencyCode == "USD") { employee.FloatAssigned = request.Amount; employee.FloatBalance = updatedBalance; }
+    db.FloatAdjustments.Add(new FloatAdjustment { OperatingDayId = operatingDay.Id, EmployeeId = employee.Id, ActorEmployeeId = EmployeeIdFor(user), PreviousAmount = previousAmount, NewAmount = request.Amount, CurrencyCode = currencyCode, Reason = request.Reason.Trim(), CreatedAtUtc = DateTime.UtcNow });
     await db.SaveChangesAsync(); await tx.CommitAsync();
-    return Results.Ok(new { employee.Id, employee.FloatAssigned, employee.FloatBalance });
+    return Results.Ok(new { employee.Id, currencyCode, floatAssigned = request.Amount, floatBalance = updatedBalance, branchReserve = branchFloat.BranchBalance });
 }).RequireAuthorization();
 app.MapPost("/api/transfers", async (CreateTransferRequest request, TransferDbContext db, ClaimsPrincipal user) => {
     if (request.Amount <= 0 || string.IsNullOrWhiteSpace(request.CustomerName)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["request"] = ["Customer and a positive amount are required."] });
@@ -410,15 +489,26 @@ app.MapPost("/api/transfers", async (CreateTransferRequest request, TransferDbCo
     var isManager = IsManager(user);
     if (!isManager && !user.IsInRole("Transfer agent") && !user.IsInRole("Senior agent")) return Results.Forbid();
     if (isManager && !CanManageBranch(user, branchId)) return Results.Forbid();
-    if (!await db.OperatingDays.AnyAsync(d => d.Date == day && d.BranchId == branchId && d.ClosedAtUtc == null)) return Results.Conflict(new { message = "Open the operating day for this branch before recording transfers." });
+    var operatingDay = await db.OperatingDays.SingleOrDefaultAsync(d => d.Date == day && d.BranchId == branchId && d.ClosedAtUtc == null);
+    if (operatingDay is null) return Results.Conflict(new { message = "Open the operating day for this branch before recording transfers." });
     var employeeId = isManager ? request.EmployeeId : EmployeeIdFor(user);
     var employee = await db.Employees.SingleOrDefaultAsync(e => e.Id == employeeId && e.BranchId == branchId && e.IsActive);
     if (employee is null) return Results.NotFound(new { message = "Active employee was not found." });
-    if (employee.FloatBalance < request.Amount) return Results.Conflict(new { message = "Insufficient employee float.", availableFloat = employee.FloatBalance });
-    employee.FloatBalance -= request.Amount;
-    var transfer = new Transfer { Reference = $"SI-{DateTime.UtcNow:yyyyMMdd}-{Guid.NewGuid():N}"[..20].ToUpperInvariant(), BranchId = branchId, EmployeeId = employee.Id, CustomerName = request.CustomerName.Trim(), DestinationCountry = destinationCountry, DestinationCity = destinationCity, Amount = request.Amount, PayoutMethod = request.PayoutMethod, Status = "Awaiting collection", CreatedAtUtc = DateTime.UtcNow };
+    var sourceCurrency = NormalizeCurrency(request.SourceCurrency);
+    var payoutCurrency = NormalizeCurrency(request.PayoutCurrency);
+    if (!supportedCurrencyNames.ContainsKey(sourceCurrency) || !supportedCurrencyNames.ContainsKey(payoutCurrency)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["currency"] = ["Select supported sending and payout currencies."] });
+    var wallet = await db.EmployeeCurrencyFloats.SingleOrDefaultAsync(item => item.OperatingDayId == operatingDay.Id && item.EmployeeId == employee.Id && item.CurrencyCode == sourceCurrency);
+    if (wallet is null || wallet.FloatBalance < request.Amount) return Results.Conflict(new { message = $"Insufficient {sourceCurrency} employee float.", availableFloat = wallet?.FloatBalance ?? 0m, currencyCode = sourceCurrency });
+    var sourceRate = sourceCurrency == "USD" ? 1m : await db.CurrencyRates.Where(rate => rate.CurrencyCode == sourceCurrency).Select(rate => (decimal?)rate.UnitsPerUsd).SingleOrDefaultAsync();
+    var payoutRate = payoutCurrency == "USD" ? 1m : await db.CurrencyRates.Where(rate => rate.CurrencyCode == payoutCurrency).Select(rate => (decimal?)rate.UnitsPerUsd).SingleOrDefaultAsync();
+    if (sourceRate is null or <= 0 || payoutRate is null or <= 0) return Results.Conflict(new { message = $"The administrator must configure a positive exchange rate for {sourceCurrency} and {payoutCurrency} before this transfer can be sent." });
+    var exchangeRate = payoutRate.Value / sourceRate.Value;
+    var payoutAmount = decimal.Round(request.Amount * exchangeRate, 2, MidpointRounding.AwayFromZero);
+    wallet.FloatBalance -= request.Amount;
+    if (sourceCurrency == "USD") employee.FloatBalance = wallet.FloatBalance;
+    var transfer = new Transfer { Reference = $"SI-{DateTime.UtcNow:yyyyMMdd}-{Guid.NewGuid():N}"[..20].ToUpperInvariant(), BranchId = branchId, EmployeeId = employee.Id, CustomerName = request.CustomerName.Trim(), DestinationCountry = destinationCountry, DestinationCity = destinationCity, Amount = request.Amount, SourceCurrency = sourceCurrency, PayoutCurrency = payoutCurrency, PayoutAmount = payoutAmount, ExchangeRate = exchangeRate, SourceUnitsPerUsd = sourceRate.Value, PayoutUnitsPerUsd = payoutRate.Value, PayoutMethod = request.PayoutMethod, Status = "Awaiting collection", CreatedAtUtc = DateTime.UtcNow };
     db.Transactions.Add(transfer); await db.SaveChangesAsync(); await tx.CommitAsync();
-    return Results.Created($"/api/transfers/{transfer.Id}", new { transfer.Id, transfer.Reference, transfer.CustomerName, transfer.DestinationCountry, transfer.DestinationCity, transfer.Amount, transfer.PayoutMethod, transfer.Status, transfer.CreatedAtUtc, transfer.EmployeeId, transfer.CollectedAtUtc, transfer.CollectionReference });
+    return Results.Created($"/api/transfers/{transfer.Id}", new { transfer.Id, transfer.Reference, transfer.CustomerName, transfer.DestinationCountry, transfer.DestinationCity, transfer.Amount, transfer.SourceCurrency, transfer.PayoutCurrency, transfer.PayoutAmount, transfer.ExchangeRate, transfer.SourceUnitsPerUsd, transfer.PayoutUnitsPerUsd, transfer.PayoutMethod, transfer.Status, transfer.CreatedAtUtc, transfer.EmployeeId, transfer.CollectedAtUtc, transfer.CollectionReference });
 }).RequireAuthorization();
 app.MapGet("/api/collections", async (TransferDbContext db, ClaimsPrincipal user, DateOnly? date) => {
     var employeeId = EmployeeIdFor(user);
@@ -435,7 +525,7 @@ app.MapGet("/api/collections", async (TransferDbContext db, ClaimsPrincipal user
                     && transfer.CreatedAtUtc >= DateTime.SpecifyKind(day.ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc)
                     && transfer.CreatedAtUtc < DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc)
                 orderby transfer.CreatedAtUtc descending
-                select new { transfer.Id, transfer.EmployeeId, transfer.BranchId, sourceBranch = branch.Name, sendingAgent = sendingAgent.Name, transfer.Reference, transfer.CustomerName, transfer.DestinationCountry, transfer.DestinationCity, transfer.Amount, transfer.PayoutMethod, transfer.Status, transfer.CreatedAtUtc, transfer.CollectedAtUtc, transfer.CollectionReference };
+                select new { transfer.Id, transfer.EmployeeId, transfer.BranchId, sourceBranch = branch.Name, sendingAgent = sendingAgent.Name, transfer.Reference, transfer.CustomerName, transfer.DestinationCountry, transfer.DestinationCity, transfer.Amount, transfer.SourceCurrency, transfer.PayoutCurrency, transfer.PayoutAmount, transfer.ExchangeRate, transfer.SourceUnitsPerUsd, transfer.PayoutUnitsPerUsd, transfer.PayoutMethod, transfer.Status, transfer.CreatedAtUtc, transfer.CollectedAtUtc, transfer.CollectionReference };
     return Results.Ok(new { country = employee.CollectionCountry, transfers = await queue.Take(500).ToListAsync() });
 }).RequireAuthorization();
 app.MapPost("/api/transfers/{id:long}/collection", async (long id, ConfirmCollectionRequest request, TransferDbContext db, ClaimsPrincipal user) => {
@@ -458,14 +548,17 @@ app.MapPost("/api/day/close", async (CloseDayRequest request, TransferDbContext 
     var operatingDay = await db.OperatingDays.SingleOrDefaultAsync(d => d.Date == day && d.BranchId == branchId && d.ClosedAtUtc == null);
     if (operatingDay is null) return Results.NotFound(new { message = "No open operating day was found." });
     var branchEmployees = await db.Employees.Where(e => e.BranchId == branchId && e.IsActive && e.Role != "Administrator").ToListAsync();
-    var employeeBalances = branchEmployees.Sum(e => e.FloatBalance);
-    var unassignedFloat = Math.Max(0, operatingDay.OpeningFloat - branchEmployees.Sum(e => e.FloatAssigned));
+    var currencyFloats = await db.OperatingDayCurrencyFloats.Where(item => item.OperatingDayId == operatingDay.Id).ToListAsync();
+    var employeeCurrencyBalances = await db.EmployeeCurrencyFloats.Where(item => item.OperatingDayId == operatingDay.Id).ToListAsync();
     var startOfDayUtc = DateTime.SpecifyKind(day.ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
     var startOfNextDayUtc = DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
     var dayTransfers = await db.Transactions.Where(t => t.BranchId == branchId && t.CreatedAtUtc >= startOfDayUtc && t.CreatedAtUtc < startOfNextDayUtc).ToListAsync();
-    operatingDay.ClosedAtUtc = DateTime.UtcNow; operatingDay.ClosingFloat = employeeBalances + unassignedFloat; operatingDay.ClosedByEmployeeId = EmployeeIdFor(user);
+    foreach (var currencyFloat in currencyFloats) {
+        currencyFloat.ClosingFloat = employeeCurrencyBalances.Where(item => item.CurrencyCode == currencyFloat.CurrencyCode).Sum(item => item.FloatBalance) + currencyFloat.BranchBalance;
+    }
+    operatingDay.ClosedAtUtc = DateTime.UtcNow; operatingDay.ClosingFloat = currencyFloats.Sum(item => item.ClosingFloat ?? 0); operatingDay.ClosedByEmployeeId = EmployeeIdFor(user);
     await db.SaveChangesAsync();
-    return Results.Ok(new { date = day, openingFloat = operatingDay.OpeningFloat, transfers = dayTransfers.Count, sent = dayTransfers.Where(t => t.Status is "Awaiting collection" or "Collected" or "Completed").Sum(t => t.Amount), collected = dayTransfers.Where(t => t.Status is "Collected" or "Completed").Sum(t => t.Amount), closingFloat = operatingDay.ClosingFloat, closedAtUtc = operatingDay.ClosedAtUtc });
+    return Results.Ok(new { date = day, openingFloat = operatingDay.OpeningFloat, currencyFloats = currencyFloats.Select(item => new { item.CurrencyCode, item.OpeningFloat, item.BranchBalance, closingFloat = item.ClosingFloat, assigned = employeeCurrencyBalances.Where(wallet => wallet.CurrencyCode == item.CurrencyCode).Sum(wallet => wallet.FloatAssigned), available = employeeCurrencyBalances.Where(wallet => wallet.CurrencyCode == item.CurrencyCode).Sum(wallet => wallet.FloatBalance) + item.BranchBalance, sent = dayTransfers.Where(t => t.SourceCurrency == item.CurrencyCode && (t.Status is "Awaiting collection" or "Collected" or "Completed")).Sum(t => t.Amount), collected = dayTransfers.Where(t => t.PayoutCurrency == item.CurrencyCode && (t.Status is "Collected" or "Completed")).Sum(t => t.PayoutAmount) }), transfers = dayTransfers.Count, sentUsdEquivalent = dayTransfers.Where(t => t.Status is "Awaiting collection" or "Collected" or "Completed").Sum(t => t.Amount / t.SourceUnitsPerUsd), collectedPayoutTotals = dayTransfers.Where(t => t.Status is "Collected" or "Completed").GroupBy(t => t.PayoutCurrency).Select(group => new { currencyCode = group.Key, amount = group.Sum(t => t.PayoutAmount) }), closingFloat = operatingDay.ClosingFloat, closedAtUtc = operatingDay.ClosedAtUtc });
 }).RequireAuthorization();
 app.Run();
 
