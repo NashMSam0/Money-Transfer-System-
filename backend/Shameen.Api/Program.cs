@@ -232,6 +232,24 @@ app.MapGet("/api/dashboard", async (TransferDbContext db, ClaimsPrincipal user, 
     var collectedCount = transactions.Count(t => t.Status is "Collected" or "Completed");
     return Results.Ok(new { date = day, transferCount = transactions.Count, totalSent = sentAmount, availableFloat = agents.Sum(e => e.FloatBalance) + unassignedFloat, successRate = transactions.Count == 0 ? 100 : Math.Round(100d * collectedCount / transactions.Count), agents });
 }).RequireAuthorization();
+app.MapGet("/api/dashboard/branches", async (TransferDbContext db, ClaimsPrincipal user, DateOnly? date) => {
+    if (!user.IsInRole("Administrator")) return Results.Forbid();
+    var day = date ?? DateOnly.FromDateTime(DateTime.UtcNow);
+    var startOfDayUtc = DateTime.SpecifyKind(day.ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
+    var startOfNextDayUtc = DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc);
+    var branches = await db.Branches.AsNoTracking().OrderBy(b => b.Country).ThenBy(b => b.City).Select(b => new { b.Id, b.Name, b.City, b.Country }).ToListAsync();
+    var employeeStats = await db.Employees.AsNoTracking().Where(e => e.IsActive && e.Role != "Administrator").GroupBy(e => e.BranchId).Select(group => new { BranchId = group.Key, ActiveAgents = group.Count(), AssignedFloat = group.Sum(e => e.FloatAssigned), AgentFloat = group.Sum(e => e.FloatBalance) }).ToListAsync();
+    var transferStats = await db.Transactions.AsNoTracking().Where(t => t.CreatedAtUtc >= startOfDayUtc && t.CreatedAtUtc < startOfNextDayUtc).GroupBy(t => t.BranchId).Select(group => new { BranchId = group.Key, TransferCount = group.Count(), TotalSent = group.Sum(t => t.Amount), CollectedCount = group.Count(t => t.Status == "Collected" || t.Status == "Completed"), AwaitingCount = group.Count(t => t.Status == "Awaiting collection") }).ToListAsync();
+    var operatingDays = await db.OperatingDays.AsNoTracking().Where(d => d.Date == day).Select(d => new { d.BranchId, d.OpeningFloat, d.ClosedAtUtc }).ToListAsync();
+    return Results.Ok(branches.Select(branch => {
+        var agents = employeeStats.FirstOrDefault(item => item.BranchId == branch.Id);
+        var transfers = transferStats.FirstOrDefault(item => item.BranchId == branch.Id);
+        var operatingDay = operatingDays.FirstOrDefault(item => item.BranchId == branch.Id);
+        var isOpen = operatingDay is { ClosedAtUtc: null };
+        var unassignedFloat = isOpen ? Math.Max(0, operatingDay!.OpeningFloat - (agents?.AssignedFloat ?? 0)) : 0;
+        return new { branch.Id, branch.Name, branch.City, branch.Country, ActiveAgents = agents?.ActiveAgents ?? 0, AssignedFloat = agents?.AssignedFloat ?? 0, AvailableFloat = (agents?.AgentFloat ?? 0) + unassignedFloat, TransferCount = transfers?.TransferCount ?? 0, TotalSent = transfers?.TotalSent ?? 0, CollectedCount = transfers?.CollectedCount ?? 0, AwaitingCount = transfers?.AwaitingCount ?? 0, OpeningFloat = operatingDay?.OpeningFloat ?? 0, IsOpen = isOpen };
+    }));
+}).RequireAuthorization();
 app.MapGet("/api/employees", async (TransferDbContext db, ClaimsPrincipal user, int? branchId) => {
     var query = db.Employees.Where(e => e.Role != "Administrator").AsQueryable();
     if (user.IsInRole("Administrator")) { if (branchId is { } requested) query = query.Where(e => e.BranchId == requested); }

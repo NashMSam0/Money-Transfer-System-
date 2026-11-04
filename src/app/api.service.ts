@@ -27,6 +27,7 @@ export class ApiService {
       day: this.http.get<any>('/api/day/current?branchId=' + branchId)
     });
   }
+  getBranchSummary(date = new Date().toISOString().slice(0, 10)) { return this.http.get<any[]>('/api/dashboard/branches?date=' + encodeURIComponent(date)); }
   openDay(openingFloat: number, branchId: number) { return this.http.post('/api/day/open', { openingFloat, employeeId: null, branchId }); }
   createTransfer(transfer: { employeeId: number; branchId: number; customerName: string; destinationCountry: string; destinationCity: string; amount: number; payoutMethod: string }) { return this.http.post<any>('/api/transfers', transfer); }
   confirmCollection(id: number, collectionReference: string) { return this.http.post<any>('/api/transfers/' + id + '/collection', { collectionReference }); }
