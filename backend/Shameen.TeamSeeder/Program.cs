@@ -9,16 +9,84 @@ var targetConnection = Environment.GetEnvironmentVariable("DATABASE_URL");
 var sharedPassword = Environment.GetEnvironmentVariable("SHAMEEN_SEED_PASSWORD");
 var supervisorsOnly = args.Contains("--supervisors-only", StringComparer.OrdinalIgnoreCase);
 var countryAgentsOnly = args.Contains("--country-agents-only", StringComparer.OrdinalIgnoreCase);
-if (string.IsNullOrWhiteSpace(targetConnection) || string.IsNullOrWhiteSpace(sharedPassword) || (!countryAgentsOnly && string.IsNullOrWhiteSpace(sourceConnection)))
+var cityAgentsOnly = args.Contains("--city-agents-only", StringComparer.OrdinalIgnoreCase);
+if (string.IsNullOrWhiteSpace(targetConnection) || string.IsNullOrWhiteSpace(sharedPassword) || (!countryAgentsOnly && !cityAgentsOnly && string.IsNullOrWhiteSpace(sourceConnection)))
 {
-    Console.Error.WriteLine(countryAgentsOnly
-        ? "The Supabase Session Pooler URI and account password must be supplied through the country-agent helper script."
+    Console.Error.WriteLine(countryAgentsOnly || cityAgentsOnly
+        ? "The Supabase Session Pooler URI and account password must be supplied through an agent helper script."
         : "The local SQL connection, Supabase Session Pooler URI, and account password must be supplied through the helper script.");
     return 2;
 }
 
 var targetOptions = new DbContextOptionsBuilder<TransferDbContext>().UseNpgsql(ToNpgsql(targetConnection)).Options;
 await using var target = new TransferDbContext(targetOptions);
+
+if (cityAgentsOnly)
+{
+    var branches = await target.Branches.AsNoTracking().OrderBy(b => b.Country).ThenBy(b => b.City).ToListAsync();
+    if (branches.Count == 0)
+    {
+        Console.Error.WriteLine("No hosted branches were found. Start the API once so it can seed branches, then run this again.");
+        return 8;
+    }
+
+    var employees = await target.Employees.OrderBy(e => e.Id).ToListAsync();
+    var customers = await target.CustomerAccounts.AsNoTracking().Select(c => c.Email).ToListAsync();
+    var agentAccounts = branches.Select(branch =>
+    {
+        var activeAgent = employees.FirstOrDefault(employee => employee.BranchId == branch.Id && employee.IsActive && employee.Role is "Transfer agent" or "Senior agent");
+        var slug = System.Text.RegularExpressions.Regex.Replace($"{branch.Country}.{branch.City}".ToLowerInvariant(), "[^a-z0-9]+", ".").Trim('.');
+        return (Branch: branch, Existing: activeAgent, Email: $"agent.{slug}@shameen.local");
+    }).ToList();
+    var duplicateEmails = agentAccounts.GroupBy(account => account.Email, StringComparer.OrdinalIgnoreCase).Where(group => group.Count() > 1).ToList();
+    var emailConflicts = agentAccounts.Where(account => customers.Contains(account.Email, StringComparer.OrdinalIgnoreCase)
+        || employees.Any(employee => employee.Email.Equals(account.Email, StringComparison.OrdinalIgnoreCase) && !ReferenceEquals(employee, account.Existing))).ToList();
+    if (duplicateEmails.Count > 0 || emailConflicts.Count > 0)
+    {
+        Console.Error.WriteLine("No accounts were changed. Generated city-agent emails conflict with existing accounts.");
+        foreach (var email in duplicateEmails.Select(group => group.Key).Concat(emailConflicts.Select(account => account.Email)).Distinct(StringComparer.OrdinalIgnoreCase))
+            Console.Error.WriteLine(email);
+        return 9;
+    }
+
+    var cityAccountsToCreate = agentAccounts.Count(account => account.Existing is null);
+    var loginsToEnable = agentAccounts.Count(account => account.Existing is { PasswordHash: null });
+    Console.WriteLine($"Found {branches.Count} branches. {cityAccountsToCreate} need a new agent account; {loginsToEnable} existing active agents need a login; branches with an existing login will be left unchanged.");
+    Console.WriteLine("No transfer history, float, or current passwords will be changed.");
+    Console.Write("Type SEED to continue: ");
+    if (!string.Equals(Console.ReadLine(), "SEED", StringComparison.Ordinal))
+    {
+        Console.WriteLine("Cancelled. No hosted records were changed.");
+        return 0;
+    }
+
+    await using var cityTransaction = await target.Database.BeginTransactionAsync();
+    var cityHasher = new PasswordHasher<Employee>();
+    var loginRows = new List<(string Country, string City, string Name, string Email, string Result)>();
+    foreach (var account in agentAccounts)
+    {
+        var employee = account.Existing;
+        var isNew = employee is null;
+        if (employee is null)
+        {
+            employee = new Employee { Name = $"{account.Branch.City} Transfer Agent", Email = account.Email, Role = "Transfer agent", BranchId = account.Branch.Id, IsActive = true };
+            target.Employees.Add(employee);
+        }
+        if (employee.PasswordHash is null) employee.PasswordHash = cityHasher.HashPassword(employee, sharedPassword!);
+        loginRows.Add((account.Branch.Country, account.Branch.City, employee.Name, employee.Email, isNew ? "created" : account.Existing!.PasswordHash is null ? "login enabled" : "existing login unchanged"));
+    }
+    await target.SaveChangesAsync();
+    await cityTransaction.CommitAsync();
+
+    var csv = new System.Text.StringBuilder("Country,City,Name,Email,Result\r\n");
+    foreach (var row in loginRows.OrderBy(row => row.Country, StringComparer.OrdinalIgnoreCase).ThenBy(row => row.City, StringComparer.OrdinalIgnoreCase))
+        csv.AppendLine($"{Csv(row.Country)},{Csv(row.City)},{Csv(row.Name)},{Csv(row.Email)},{Csv(row.Result)}");
+    var csvPath = Path.Combine(Environment.CurrentDirectory, "city-agent-accounts.csv");
+    await File.WriteAllTextAsync(csvPath, csv.ToString());
+    Console.WriteLine($"City agents complete. Processed {branches.Count} branches; created {cityAccountsToCreate} agents and enabled {loginsToEnable} existing agent logins.");
+    Console.WriteLine($"Account list saved to {csvPath}. Passwords are not included.");
+    return 0;
+}
 
 if (countryAgentsOnly)
 {

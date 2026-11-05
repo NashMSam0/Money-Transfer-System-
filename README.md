@@ -36,6 +36,10 @@ The tool prints source row counts and requires typing `IMPORT`. It refuses to pr
 
 Run `./scripts/Seed-OnlineBranchesAndAgents.ps1` from PowerShell in the repository to recreate branches and non-administrator employee accounts from the local SQL Server database on the hosted PostgreSQL database. The script prompts for the Supabase Session Pooler URI and the shared account password with hidden input. It preserves the hosted administrator, ensures branches by city, creates missing employees, updates matching emails, and requires typing `SEED` before writing. New and updated agent floats are reset to zero. Operating days, transfers, and float adjustments are never copied by this tool. Use `./scripts/Seed-OnlineBranchesAndAgents.ps1 -SupervisorsOnly` to create or refresh one supervisor account per local branch city without resetting agent accounts or floats.
 
+### Ensure each city branch has an agent login
+
+Run `./scripts/Seed-CityAgents.ps1` to check every hosted branch and ensure it has an active transfer-agent login. It preserves existing agent accounts and passwords, enables a login on an active agent who has no password yet, and creates a city-named agent where a branch has no active agent. It requires typing `SEED` before writing and saves the email list to `city-agent-accounts.csv`. The password entered at the hidden prompt is applied only to newly created accounts and active agents who had no login.
+
 Administrators and supervisors can manage employee access from Team & float. Supervisors are restricted to their assigned branch and can manage that branch's team, float, transfers, and daily operations; only administrators can manage other branches or workspace settings. All signed-in users can change their own password from the profile menu after confirming their current password. The supervisor seeding option creates emails in the form `supervisor.<city-slug>@shameen.local`, uses the password entered at the hidden prompt, and saves a local `city-supervisor-accounts.csv` login list without passwords.
 
 ### Customer transfer portal
