@@ -165,6 +165,9 @@ await using (var scope = app.Services.CreateAsyncScope())
         IF OBJECT_ID(N'dbo.CustomerTransferRequests', N'U') IS NULL CREATE TABLE dbo.CustomerTransferRequests (Id bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_CustomerTransferRequests PRIMARY KEY, CustomerAccountId int NOT NULL, Reference nvarchar(32) NOT NULL, RecipientName nvarchar(160) NOT NULL, DestinationCountry nvarchar(80) NOT NULL, DestinationCity nvarchar(100) NOT NULL, SourceCurrency nvarchar(3) NOT NULL, Amount decimal(18,2) NOT NULL, PayoutCurrency nvarchar(3) NOT NULL, PayoutAmount decimal(18,2) NOT NULL CONSTRAINT DF_CustomerTransferRequests_PayoutAmount DEFAULT(0), ExchangeRate decimal(18,8) NOT NULL CONSTRAINT DF_CustomerTransferRequests_ExchangeRate DEFAULT(1), PayoutMethod nvarchar(40) NOT NULL, Status nvarchar(32) NOT NULL, CreatedAtUtc datetime2 NOT NULL, ReviewedAtUtc datetime2 NULL, ReviewedByEmployeeId int NULL, WalletDebitEntryId bigint NULL, CONSTRAINT FK_CustomerTransferRequests_CustomerAccounts FOREIGN KEY (CustomerAccountId) REFERENCES dbo.CustomerAccounts(Id));
         IF COL_LENGTH(N'dbo.CustomerTransferRequests', N'PayoutAmount') IS NULL ALTER TABLE dbo.CustomerTransferRequests ADD PayoutAmount decimal(18,2) NOT NULL CONSTRAINT DF_CustomerTransferRequests_PayoutAmount DEFAULT(0) WITH VALUES;
         IF COL_LENGTH(N'dbo.CustomerTransferRequests', N'ExchangeRate') IS NULL ALTER TABLE dbo.CustomerTransferRequests ADD ExchangeRate decimal(18,8) NOT NULL CONSTRAINT DF_CustomerTransferRequests_ExchangeRate DEFAULT(1) WITH VALUES;
+        IF COL_LENGTH(N'dbo.CustomerTransferRequests', N'CollectedAtUtc') IS NULL ALTER TABLE dbo.CustomerTransferRequests ADD CollectedAtUtc datetime2 NULL;
+        IF COL_LENGTH(N'dbo.CustomerTransferRequests', N'CollectionConfirmedByEmployeeId') IS NULL ALTER TABLE dbo.CustomerTransferRequests ADD CollectionConfirmedByEmployeeId int NULL;
+        IF COL_LENGTH(N'dbo.CustomerTransferRequests', N'CollectionReference') IS NULL ALTER TABLE dbo.CustomerTransferRequests ADD CollectionReference nvarchar(120) NULL;
         IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerTransferRequests') AND name=N'IX_CustomerTransferRequests_Reference') CREATE UNIQUE INDEX IX_CustomerTransferRequests_Reference ON dbo.CustomerTransferRequests(Reference);
         IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerTransferRequests') AND name=N'IX_CustomerTransferRequests_CustomerAccountId_CreatedAtUtc') CREATE INDEX IX_CustomerTransferRequests_CustomerAccountId_CreatedAtUtc ON dbo.CustomerTransferRequests(CustomerAccountId, CreatedAtUtc);
         """);
@@ -318,12 +321,12 @@ app.MapPost("/api/client/transfers", async (CustomerTransferRequestPayload reque
 }).RequireAuthorization();
 app.MapGet("/api/client/transfers", async (ClaimsPrincipal user, TransferDbContext db) => {
     var id = int.Parse(user.FindFirstValue("customer_id")!);
-    return Results.Ok(await db.CustomerTransferRequests.AsNoTracking().Where(r => r.CustomerAccountId == id).OrderByDescending(r => r.CreatedAtUtc).Take(100).Select(r => new { r.Id, r.Reference, r.RecipientName, r.DestinationCountry, r.DestinationCity, r.SourceCurrency, r.Amount, r.PayoutCurrency, r.PayoutAmount, r.ExchangeRate, r.PayoutMethod, r.Status, r.CreatedAtUtc }).ToListAsync());
+    return Results.Ok(await db.CustomerTransferRequests.AsNoTracking().Where(r => r.CustomerAccountId == id).OrderByDescending(r => r.CreatedAtUtc).Take(100).Select(r => new { r.Id, r.Reference, r.RecipientName, r.DestinationCountry, r.DestinationCity, r.SourceCurrency, r.Amount, r.PayoutCurrency, r.PayoutAmount, r.ExchangeRate, r.PayoutMethod, r.Status, r.CreatedAtUtc, r.CollectedAtUtc, r.CollectionReference }).ToListAsync());
 }).RequireAuthorization();
 app.MapGet("/api/customer-requests", async (ClaimsPrincipal user, TransferDbContext db) => {
     if (!IsManager(user)) return Results.Forbid();
     var pendingTopUps = await db.CustomerWalletEntries.AsNoTracking().Where(e => e.Kind == "TopUp" && e.Status == "Pending").OrderBy(e => e.CreatedAtUtc).Select(e => new { e.Id, e.Reference, customerName = e.Customer!.Name, customerEmail = e.Customer.Email, e.CurrencyCode, e.Amount, e.PaymentReference, e.CreatedAtUtc, kind = e.Kind, destination = (string?)null, city = (string?)null, e.Status }).ToListAsync();
-    var pendingTransfers = await db.CustomerTransferRequests.AsNoTracking().Where(r => r.Status == "Pending review").OrderBy(r => r.CreatedAtUtc).Select(r => new { id = r.Id, r.Reference, customerName = r.Customer!.Name, customerEmail = r.Customer.Email, currencyCode = r.SourceCurrency, r.Amount, r.PayoutCurrency, r.PayoutAmount, paymentReference = (string?)null, r.CreatedAtUtc, kind = "Transfer", destination = r.DestinationCountry, city = r.DestinationCity, r.Status }).ToListAsync();
+    var pendingTransfers = await db.CustomerTransferRequests.AsNoTracking().OrderByDescending(r => r.CreatedAtUtc).Take(500).Select(r => new { id = r.Id, r.Reference, customerName = r.Customer!.Name, customerEmail = r.Customer.Email, currencyCode = r.SourceCurrency, r.Amount, payoutCurrency = r.PayoutCurrency, payoutAmount = r.PayoutAmount, paymentReference = (string?)null, r.CreatedAtUtc, kind = "Transfer", destination = r.DestinationCountry, city = r.DestinationCity, r.Status }).ToListAsync();
     var cashifyPayments = await db.CustomerWalletEntries.AsNoTracking().Where(e => e.Kind == "TopUp" && e.Status == "Approved" && e.PaymentReference != null && e.PaymentReference.StartsWith("Cashify SIM | ")).OrderByDescending(e => e.CreatedAtUtc).Take(100).Select(e => new { e.Id, e.Reference, customerName = e.Customer!.Name, customerEmail = e.Customer.Email, currencyCode = e.CurrencyCode, e.Amount, paymentReference = e.PaymentReference, createdAtUtc = e.CreatedAtUtc }).ToListAsync();
     return Results.Ok(new { topUps = pendingTopUps, transfers = pendingTransfers, cashifyPayments });
 }).RequireAuthorization();
@@ -345,6 +348,20 @@ app.MapPost("/api/customer-requests/transfers/{id:long}/review", async (long id,
     if (debit is null || debit.Status != "Reserved") return Results.Conflict(new { message = "The wallet reservation could not be verified." });
     var approved = request.Decision == "approve"; transferRequest.Status = approved ? "Accepted for processing" : "Declined"; transferRequest.ReviewedAtUtc = DateTime.UtcNow; transferRequest.ReviewedByEmployeeId = EmployeeIdFor(user); debit.Status = approved ? "Posted" : "Rejected"; debit.ReviewedAtUtc = DateTime.UtcNow; debit.ReviewedByEmployeeId = EmployeeIdFor(user);
     await db.SaveChangesAsync(); await tx.CommitAsync(); return Results.Ok(new { transferRequest.Id, transferRequest.Status });
+}).RequireAuthorization();
+app.MapPost("/api/customer-transfers/{id:long}/collection", async (long id, ConfirmCollectionRequest request, TransferDbContext db, ClaimsPrincipal user) => {
+    var employeeId = EmployeeIdFor(user);
+    var receiver = await db.Employees.Include(e => e.Branch).SingleOrDefaultAsync(e => e.Id == employeeId && e.IsActive);
+    if (receiver?.CollectionCountry is null) return Results.Forbid();
+    await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+    var transfer = await db.CustomerTransferRequests.SingleOrDefaultAsync(t => t.Id == id);
+    if (transfer is null) return Results.NotFound(new { message = "Customer transfer not found." });
+    if (!string.Equals(transfer.DestinationCountry, receiver.CollectionCountry, StringComparison.OrdinalIgnoreCase) || !string.Equals(transfer.DestinationCity, receiver.Branch?.City, StringComparison.OrdinalIgnoreCase)) return Results.Forbid();
+    if (transfer.Status != "Accepted for processing") return Results.Conflict(new { message = "Only accepted customer transfers can be confirmed as collected." });
+    if (request.CollectionReference?.Trim().Length > 120) return Results.ValidationProblem(new Dictionary<string, string[]> { ["collectionReference"] = ["Collection reference must be 120 characters or fewer."] });
+    transfer.Status = "Collected"; transfer.CollectedAtUtc = DateTime.UtcNow; transfer.CollectionConfirmedByEmployeeId = employeeId; transfer.CollectionReference = string.IsNullOrWhiteSpace(request.CollectionReference) ? null : request.CollectionReference.Trim();
+    await db.SaveChangesAsync(); await tx.CommitAsync();
+    return Results.Ok(new { transfer.Id, transfer.Reference, transfer.Status, transfer.CollectedAtUtc, transfer.CollectionReference, transfer.CollectionConfirmedByEmployeeId });
 }).RequireAuthorization();
 app.MapPut("/api/auth/password", async (ChangeOwnPasswordRequest request, ClaimsPrincipal user, TransferDbContext db, PasswordHasher<Employee> hasher) => {
     if (string.IsNullOrWhiteSpace(request.NewPassword) || request.NewPassword.Length < 12) return Results.ValidationProblem(new Dictionary<string, string[]> { ["newPassword"] = ["New password must be at least 12 characters."] });
@@ -679,7 +696,14 @@ app.MapGet("/api/collections", async (TransferDbContext db, ClaimsPrincipal user
                     && transfer.CreatedAtUtc < DateTime.SpecifyKind(day.AddDays(1).ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc)
                 orderby transfer.CreatedAtUtc descending
                 select new { transfer.Id, transfer.EmployeeId, transfer.BranchId, sourceBranch = branch.Name, sendingAgent = sendingAgent.Name, transfer.Reference, transfer.CustomerName, transfer.DestinationCountry, transfer.DestinationCity, transfer.Amount, transfer.SourceCurrency, transfer.PayoutCurrency, transfer.PayoutAmount, transfer.ExchangeRate, transfer.SourceUnitsPerUsd, transfer.PayoutUnitsPerUsd, transfer.PayoutMethod, transfer.Status, transfer.CreatedAtUtc, transfer.CollectedAtUtc, transfer.CollectionReference };
-    return Results.Ok(new { country = employee.CollectionCountry, transfers = await queue.Take(500).ToListAsync() });
+    var customerTransfers = await db.CustomerTransferRequests.AsNoTracking()
+        .Where(transfer => transfer.DestinationCountry == employee.CollectionCountry
+            && transfer.DestinationCity == receivingCity
+            && (transfer.Status == "Accepted for processing" || transfer.Status == "Collected"))
+        .OrderByDescending(transfer => transfer.CreatedAtUtc).Take(500)
+        .Select(transfer => new { transfer.Id, transfer.Reference, customerName = transfer.RecipientName, senderName = transfer.Customer!.Name, transfer.DestinationCountry, transfer.DestinationCity, amount = transfer.Amount, transfer.SourceCurrency, transfer.PayoutCurrency, transfer.PayoutAmount, transfer.ExchangeRate, transfer.PayoutMethod, transfer.Status, transfer.CreatedAtUtc, transfer.CollectedAtUtc, transfer.CollectionReference, sourceBranch = "Customer portal", customerRequest = true })
+        .ToListAsync();
+    return Results.Ok(new { country = employee.CollectionCountry, transfers = await queue.Take(500).ToListAsync(), customerTransfers });
 }).RequireAuthorization();
 app.MapPost("/api/transfers/{id:long}/collection", async (long id, ConfirmCollectionRequest request, TransferDbContext db, ClaimsPrincipal user) => {
     await using var confirmationTransaction = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);

@@ -47,6 +47,7 @@ export class ApiService {
   openDay(currencyFloats: Array<{currencyCode:string;amount:number}>, branchId: number) { return this.http.post('/api/day/open', { openingFloat: currencyFloats.reduce((sum,item)=>sum+item.amount,0), currencyFloats, employeeId: null, branchId }); }
   createTransfer(transfer: { employeeId: number; branchId: number; customerName: string; destinationCountry: string; destinationCity: string; amount: number; payoutMethod: string; sourceCurrency:string; payoutCurrency:string }) { return this.http.post<any>('/api/transfers', transfer); }
   confirmCollection(id: number, collectionReference: string) { return this.http.post<any>('/api/transfers/' + id + '/collection', { collectionReference }); }
+  confirmCustomerCollection(id: number, collectionReference: string) { return this.http.post<any>('/api/customer-transfers/' + id + '/collection', { collectionReference }); }
   updateTransferDestinationCity(id: number, destinationCity: string) { return this.http.put<any>('/api/transfers/' + id + '/destination-city', { destinationCity }); }
   getCollectionQueue(date = new Date().toISOString().slice(0, 10)) { return this.http.get<any>('/api/collections?date=' + encodeURIComponent(date)); }
   setEmployeeCollectionCountry(id: number, country: string | null) { return this.http.put('/api/employees/' + id + '/collection-country', { country }); }

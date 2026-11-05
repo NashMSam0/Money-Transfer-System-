@@ -167,6 +167,16 @@ namespace Shameen.Api.Data.Migrations.Postgres
                     b.Property<int>("CustomerAccountId")
                         .HasColumnType("integer");
 
+                    b.Property<DateTime?>("CollectedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int?>("CollectionConfirmedByEmployeeId")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("CollectionReference")
+                        .HasMaxLength(120)
+                        .HasColumnType("character varying(120)");
+
                     b.Property<DateTime>("ExpiresAtUtc")
                         .HasColumnType("timestamp with time zone");
 
