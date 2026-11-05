@@ -8,16 +8,71 @@ var sourceConnection = Environment.GetEnvironmentVariable("SHAMEEN_SQLSERVER_CON
 var targetConnection = Environment.GetEnvironmentVariable("DATABASE_URL");
 var sharedPassword = Environment.GetEnvironmentVariable("SHAMEEN_SEED_PASSWORD");
 var supervisorsOnly = args.Contains("--supervisors-only", StringComparer.OrdinalIgnoreCase);
-if (string.IsNullOrWhiteSpace(sourceConnection) || string.IsNullOrWhiteSpace(targetConnection) || string.IsNullOrWhiteSpace(sharedPassword))
+var countryAgentsOnly = args.Contains("--country-agents-only", StringComparer.OrdinalIgnoreCase);
+if (string.IsNullOrWhiteSpace(targetConnection) || string.IsNullOrWhiteSpace(sharedPassword) || (!countryAgentsOnly && string.IsNullOrWhiteSpace(sourceConnection)))
 {
-    Console.Error.WriteLine("The local SQL connection, Supabase Session Pooler URI, and account password must be supplied through the helper script.");
+    Console.Error.WriteLine(countryAgentsOnly
+        ? "The Supabase Session Pooler URI and account password must be supplied through the country-agent helper script."
+        : "The local SQL connection, Supabase Session Pooler URI, and account password must be supplied through the helper script.");
     return 2;
 }
 
-var sourceOptions = new DbContextOptionsBuilder<TransferDbContext>().UseSqlServer(sourceConnection).Options;
 var targetOptions = new DbContextOptionsBuilder<TransferDbContext>().UseNpgsql(ToNpgsql(targetConnection)).Options;
-await using var source = new TransferDbContext(sourceOptions);
 await using var target = new TransferDbContext(targetOptions);
+
+if (countryAgentsOnly)
+{
+    var countries = new (string Country, string City, string Name, string Email)[]
+    {
+        ("Zambia", "Lusaka", "Chipo Mwansa", "chipo.mwansa@shameen.local"),
+        ("Zimbabwe", "Harare", "Tariro Moyo", "tariro.moyo@shameen.local"),
+        ("South Africa", "Johannesburg", "Thandi Mokoena", "thandi.mokoena@shameen.local"),
+        ("Tanzania", "Dar es Salaam", "Neema Mushi", "neema.mushi@shameen.local"),
+        ("Kenya", "Nairobi", "Wanjiku Kamau", "wanjiku.kamau@shameen.local"),
+        ("Uganda", "Kampala", "Achen Okello", "achen.okello@shameen.local"),
+        ("United Kingdom", "London", "Oliver Bennett", "oliver.bennett@shameen.local")
+    };
+    var branches = await target.Branches.AsNoTracking().ToListAsync();
+    var missingCountries = countries.Where(account => !branches.Any(branch => branch.Country.Equals(account.Country, StringComparison.OrdinalIgnoreCase))).Select(account => account.Country).Distinct().ToArray();
+    if (missingCountries.Length > 0)
+    {
+        Console.Error.WriteLine("No hosted branch was found for: " + string.Join(", ", missingCountries));
+        return 6;
+    }
+    var existingEmployees = await target.Employees.ToListAsync();
+    var conflicts = countries.Where(account => existingEmployees.Any(employee => employee.Email.Equals(account.Email, StringComparison.OrdinalIgnoreCase) && employee.Role != "Transfer agent")).ToList();
+    if (conflicts.Count > 0)
+    {
+        Console.Error.WriteLine("No accounts were changed. These email addresses already belong to another role: " + string.Join(", ", conflicts.Select(account => account.Email)));
+        return 7;
+    }
+    var countryHasher = new PasswordHasher<Employee>();
+    await using var countryTransaction = await target.Database.BeginTransactionAsync();
+    var created = new List<(string Country, string Name, string Email, bool New)>();
+    foreach (var account in countries)
+    {
+        var employee = existingEmployees.FirstOrDefault(item => item.Email.Equals(account.Email, StringComparison.OrdinalIgnoreCase));
+        var isNew = employee is null;
+        if (employee is null)
+        {
+            var branch = branches.FirstOrDefault(item => item.Country.Equals(account.Country, StringComparison.OrdinalIgnoreCase) && item.City.Equals(account.City, StringComparison.OrdinalIgnoreCase))
+                ?? branches.First(item => item.Country.Equals(account.Country, StringComparison.OrdinalIgnoreCase));
+            employee = new Employee { Name = account.Name, Email = account.Email, Role = "Transfer agent", BranchId = branch.Id, IsActive = true };
+            employee.PasswordHash = countryHasher.HashPassword(employee, sharedPassword!);
+            target.Employees.Add(employee);
+            existingEmployees.Add(employee);
+        }
+        created.Add((account.Country, employee.Name, employee.Email, isNew));
+    }
+    await target.SaveChangesAsync();
+    await countryTransaction.CommitAsync();
+    Console.WriteLine("Country agents (new accounts receive the requested password; existing accounts are left unchanged):");
+    foreach (var account in created) Console.WriteLine($"{account.Country}\t{account.Name}\t{account.Email}\t{(account.New ? "created" : "already existed; unchanged")}");
+    return 0;
+}
+
+var sourceOptions = new DbContextOptionsBuilder<TransferDbContext>().UseSqlServer(sourceConnection!).Options;
+await using var source = new TransferDbContext(sourceOptions);
 
 var sourceBranches = await source.Branches.AsNoTracking().OrderBy(b => b.Id).ToListAsync();
 var sourceEmployees = await source.Employees.AsNoTracking().Include(e => e.Branch).Where(e => e.Role != "Administrator" && e.Role != "Supervisor").OrderBy(e => e.Id)
