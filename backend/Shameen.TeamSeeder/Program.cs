@@ -23,10 +23,22 @@ await using var target = new TransferDbContext(targetOptions);
 
 if (cityAgentsOnly)
 {
-    var branches = await target.Branches.AsNoTracking().OrderBy(b => b.Country).ThenBy(b => b.City).ToListAsync();
+    var branches = await target.Branches.OrderBy(b => b.Country).ThenBy(b => b.City).ToListAsync();
+    var destinations = await target.DestinationCities.AsNoTracking().OrderBy(c => c.Country).ThenBy(c => c.City).ToListAsync();
+    var branchesToAdd = destinations
+        .Where(city => !branches.Any(branch => branch.Country.Equals(city.Country, StringComparison.OrdinalIgnoreCase) && branch.City.Equals(city.City, StringComparison.OrdinalIgnoreCase)))
+        .Select(city =>
+        {
+            var suffix = $", {city.Country}";
+            var prefix = $"Shameen {city.City}";
+            var name = prefix[..Math.Min(prefix.Length, 80 - suffix.Length)].TrimEnd() + suffix;
+            return new Branch { Name = name, City = city.City, Country = city.Country };
+        })
+        .ToList();
+    branches.AddRange(branchesToAdd);
     if (branches.Count == 0)
     {
-        Console.Error.WriteLine("No hosted branches were found. Start the API once so it can seed branches, then run this again.");
+        Console.Error.WriteLine("No hosted branches or destination cities were found. Start the API once so it can seed location data, then run this again.");
         return 8;
     }
 
@@ -51,8 +63,8 @@ if (cityAgentsOnly)
 
     var cityAccountsToCreate = agentAccounts.Count(account => account.Existing is null);
     var loginsToEnable = agentAccounts.Count(account => account.Existing is { PasswordHash: null });
-    Console.WriteLine($"Found {branches.Count} branches. {cityAccountsToCreate} need a new agent account; {loginsToEnable} existing active agents need a login; branches with an existing login will be left unchanged.");
-    Console.WriteLine("No transfer history, float, or current passwords will be changed.");
+    Console.WriteLine($"Found {destinations.Count} destination cities and {branches.Count} branch locations. {branchesToAdd.Count} branches need to be added; {cityAccountsToCreate} locations need an agent account; {loginsToEnable} existing active agents need a login.");
+    Console.WriteLine("Existing passwords, transfer history, and float balances will be left unchanged.");
     Console.Write("Type SEED to continue: ");
     if (!string.Equals(Console.ReadLine(), "SEED", StringComparison.Ordinal))
     {
@@ -61,6 +73,8 @@ if (cityAgentsOnly)
     }
 
     await using var cityTransaction = await target.Database.BeginTransactionAsync();
+    target.Branches.AddRange(branchesToAdd);
+    await target.SaveChangesAsync();
     var cityHasher = new PasswordHasher<Employee>();
     var loginRows = new List<(string Country, string City, string Name, string Email, string Result)>();
     foreach (var account in agentAccounts)
@@ -83,7 +97,7 @@ if (cityAgentsOnly)
         csv.AppendLine($"{Csv(row.Country)},{Csv(row.City)},{Csv(row.Name)},{Csv(row.Email)},{Csv(row.Result)}");
     var csvPath = Path.Combine(Environment.CurrentDirectory, "city-agent-accounts.csv");
     await File.WriteAllTextAsync(csvPath, csv.ToString());
-    Console.WriteLine($"City agents complete. Processed {branches.Count} branches; created {cityAccountsToCreate} agents and enabled {loginsToEnable} existing agent logins.");
+    Console.WriteLine($"City agents complete. Ensured {branches.Count} city branches; created {branchesToAdd.Count} branches, {cityAccountsToCreate} agents, and enabled {loginsToEnable} existing agent logins.");
     Console.WriteLine($"Account list saved to {csvPath}. Passwords are not included.");
     return 0;
 }
