@@ -41,11 +41,19 @@ builder.Services.AddCors(options => options.AddDefaultPolicy(policy => policy.Wi
 builder.Services.AddAuthentication("TabSession").AddScheme<AuthenticationSchemeOptions, TabSessionAuthenticationHandler>("TabSession", _ => { });
 builder.Services.AddAuthorization(options => options.AddPolicy("AdminOnly", policy => policy.RequireRole("Administrator")));
 builder.Services.AddScoped<PasswordHasher<Employee>>();
+builder.Services.AddScoped<PasswordHasher<CustomerAccount>>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options => options.SwaggerDoc("v1", new OpenApiInfo { Title = "Shameen Investments Transfer API", Version = "v1", Description = "Transfer desk, employee float, and daily reconciliation API." }));
 var app = builder.Build();
 app.UseCors();
 app.UseAuthentication();
+app.Use(async (context, next) => {
+    if (context.User.IsInRole("Customer") && !context.Request.Path.StartsWithSegments("/api/client") && !context.Request.Path.Equals("/api/auth/logout")) {
+        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        return;
+    }
+    await next();
+});
 app.UseAuthorization();
 app.UseSwagger();
 app.UseSwaggerUI(options => options.SwaggerEndpoint("/swagger/v1/swagger.json", "Shameen Transfer API v1"));
@@ -146,6 +154,19 @@ await using (var scope = app.Services.CreateAsyncScope())
         EXEC(N'UPDATE dbo.Employees SET BranchId=(SELECT Id FROM dbo.Branches WHERE Name=N''Shameen Bulawayo'') WHERE Email=N''grace@shameen.local'' AND BranchId=1');
         EXEC(N'UPDATE dbo.Employees SET BranchId=(SELECT Id FROM dbo.Branches WHERE Name=N''Shameen Harare'') WHERE Email=N''peter@shameen.local'' AND BranchId=1');
         EXEC(N'UPDATE dbo.Employees SET IsActive=1 WHERE Email=N''peter@shameen.local''');
+        IF OBJECT_ID(N'dbo.CustomerAccounts', N'U') IS NULL CREATE TABLE dbo.CustomerAccounts (Id int IDENTITY(1,1) NOT NULL CONSTRAINT PK_CustomerAccounts PRIMARY KEY, Name nvarchar(160) NOT NULL, Email nvarchar(320) NOT NULL, PasswordHash nvarchar(512) NOT NULL, IsActive bit NOT NULL, CreatedAtUtc datetime2 NOT NULL);
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerAccounts') AND name=N'IX_CustomerAccounts_Email') CREATE UNIQUE INDEX IX_CustomerAccounts_Email ON dbo.CustomerAccounts(Email);
+        IF OBJECT_ID(N'dbo.CustomerSessions', N'U') IS NULL CREATE TABLE dbo.CustomerSessions (Id bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_CustomerSessions PRIMARY KEY, CustomerAccountId int NOT NULL, TokenHash nvarchar(64) NOT NULL, CreatedAtUtc datetime2 NOT NULL, ExpiresAtUtc datetime2 NOT NULL, RevokedAtUtc datetime2 NULL, CONSTRAINT FK_CustomerSessions_CustomerAccounts FOREIGN KEY (CustomerAccountId) REFERENCES dbo.CustomerAccounts(Id) ON DELETE CASCADE);
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerSessions') AND name=N'IX_CustomerSessions_TokenHash') CREATE UNIQUE INDEX IX_CustomerSessions_TokenHash ON dbo.CustomerSessions(TokenHash);
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerSessions') AND name=N'IX_CustomerSessions_CustomerAccountId_ExpiresAtUtc') CREATE INDEX IX_CustomerSessions_CustomerAccountId_ExpiresAtUtc ON dbo.CustomerSessions(CustomerAccountId, ExpiresAtUtc);
+        IF OBJECT_ID(N'dbo.CustomerWalletEntries', N'U') IS NULL CREATE TABLE dbo.CustomerWalletEntries (Id bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_CustomerWalletEntries PRIMARY KEY, CustomerAccountId int NOT NULL, Kind nvarchar(24) NOT NULL, Status nvarchar(24) NOT NULL, CurrencyCode nvarchar(3) NOT NULL, Amount decimal(18,2) NOT NULL, Reference nvarchar(32) NOT NULL, PaymentReference nvarchar(120) NULL, CreatedAtUtc datetime2 NOT NULL, ReviewedAtUtc datetime2 NULL, ReviewedByEmployeeId int NULL, CONSTRAINT FK_CustomerWalletEntries_CustomerAccounts FOREIGN KEY (CustomerAccountId) REFERENCES dbo.CustomerAccounts(Id));
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerWalletEntries') AND name=N'IX_CustomerWalletEntries_Reference') CREATE UNIQUE INDEX IX_CustomerWalletEntries_Reference ON dbo.CustomerWalletEntries(Reference);
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerWalletEntries') AND name=N'IX_CustomerWalletEntries_CustomerAccountId_CurrencyCode_Status') CREATE INDEX IX_CustomerWalletEntries_CustomerAccountId_CurrencyCode_Status ON dbo.CustomerWalletEntries(CustomerAccountId, CurrencyCode, Status);
+        IF OBJECT_ID(N'dbo.CustomerTransferRequests', N'U') IS NULL CREATE TABLE dbo.CustomerTransferRequests (Id bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_CustomerTransferRequests PRIMARY KEY, CustomerAccountId int NOT NULL, Reference nvarchar(32) NOT NULL, RecipientName nvarchar(160) NOT NULL, DestinationCountry nvarchar(80) NOT NULL, DestinationCity nvarchar(100) NOT NULL, SourceCurrency nvarchar(3) NOT NULL, Amount decimal(18,2) NOT NULL, PayoutCurrency nvarchar(3) NOT NULL, PayoutAmount decimal(18,2) NOT NULL CONSTRAINT DF_CustomerTransferRequests_PayoutAmount DEFAULT(0), ExchangeRate decimal(18,8) NOT NULL CONSTRAINT DF_CustomerTransferRequests_ExchangeRate DEFAULT(1), PayoutMethod nvarchar(40) NOT NULL, Status nvarchar(32) NOT NULL, CreatedAtUtc datetime2 NOT NULL, ReviewedAtUtc datetime2 NULL, ReviewedByEmployeeId int NULL, WalletDebitEntryId bigint NULL, CONSTRAINT FK_CustomerTransferRequests_CustomerAccounts FOREIGN KEY (CustomerAccountId) REFERENCES dbo.CustomerAccounts(Id));
+        IF COL_LENGTH(N'dbo.CustomerTransferRequests', N'PayoutAmount') IS NULL ALTER TABLE dbo.CustomerTransferRequests ADD PayoutAmount decimal(18,2) NOT NULL CONSTRAINT DF_CustomerTransferRequests_PayoutAmount DEFAULT(0) WITH VALUES;
+        IF COL_LENGTH(N'dbo.CustomerTransferRequests', N'ExchangeRate') IS NULL ALTER TABLE dbo.CustomerTransferRequests ADD ExchangeRate decimal(18,8) NOT NULL CONSTRAINT DF_CustomerTransferRequests_ExchangeRate DEFAULT(1) WITH VALUES;
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerTransferRequests') AND name=N'IX_CustomerTransferRequests_Reference') CREATE UNIQUE INDEX IX_CustomerTransferRequests_Reference ON dbo.CustomerTransferRequests(Reference);
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerTransferRequests') AND name=N'IX_CustomerTransferRequests_CustomerAccountId_CreatedAtUtc') CREATE INDEX IX_CustomerTransferRequests_CustomerAccountId_CreatedAtUtc ON dbo.CustomerTransferRequests(CustomerAccountId, CreatedAtUtc);
         """);
         await DestinationCitySeedData.EnsureAsync(db);
     }
@@ -165,6 +186,14 @@ async Task<(string Token, DateTime ExpiresAtUtc)> CreateTabSessionAsync(Employee
     var expiresAtUtc = DateTime.UtcNow.AddHours(10);
     var tokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
     db.AuthSessions.Add(new AuthSession { EmployeeId = employee.Id, TokenHash = tokenHash, CreatedAtUtc = DateTime.UtcNow, ExpiresAtUtc = expiresAtUtc });
+    await db.SaveChangesAsync();
+    return (token, expiresAtUtc);
+}
+async Task<(string Token, DateTime ExpiresAtUtc)> CreateCustomerSessionAsync(CustomerAccount customer, TransferDbContext db) {
+    var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+    var expiresAtUtc = DateTime.UtcNow.AddHours(24);
+    var tokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
+    db.CustomerSessions.Add(new CustomerSession { CustomerAccountId = customer.Id, TokenHash = tokenHash, CreatedAtUtc = DateTime.UtcNow, ExpiresAtUtc = expiresAtUtc });
     await db.SaveChangesAsync();
     return (token, expiresAtUtc);
 }
@@ -198,6 +227,125 @@ app.MapPost("/api/auth/login", async (LoginRequest request, TransferDbContext db
     var session = await CreateTabSessionAsync(employee, db);
     return Results.Ok(new { employee.Id, employee.Name, employee.Email, employee.Role, employee.BranchId, sessionToken = session.Token, session.ExpiresAtUtc });
 }).AllowAnonymous();
+app.MapPost("/api/client/register", async (CustomerRegisterRequest request, TransferDbContext db, PasswordHasher<CustomerAccount> hasher) => {
+    var name = request.Name.Trim(); var email = request.Email.Trim().ToLowerInvariant();
+    if (name.Length < 2 || name.Length > 160) return Results.ValidationProblem(new Dictionary<string, string[]> { ["name"] = ["Enter your full name (2 to 160 characters)."] });
+    if (!email.Contains('@') || email.Length > 320) return Results.ValidationProblem(new Dictionary<string, string[]> { ["email"] = ["Enter a valid email address."] });
+    if (request.Password.Length < 12) return Results.ValidationProblem(new Dictionary<string, string[]> { ["password"] = ["Choose a password of at least 12 characters."] });
+    if (await db.CustomerAccounts.AnyAsync(c => c.Email == email) || await db.Employees.AnyAsync(e => e.Email == email)) return Results.Conflict(new { message = "An account with this email already exists." });
+    var customer = new CustomerAccount { Name = name, Email = email, CreatedAtUtc = DateTime.UtcNow };
+    customer.PasswordHash = hasher.HashPassword(customer, request.Password);
+    db.CustomerAccounts.Add(customer); await db.SaveChangesAsync();
+    var session = await CreateCustomerSessionAsync(customer, db);
+    return Results.Created("/api/client/me", new { customer.Id, customer.Name, customer.Email, role = "Customer", sessionToken = session.Token, expiresAtUtc = session.ExpiresAtUtc });
+}).AllowAnonymous();
+app.MapPost("/api/client/login", async (CustomerLoginRequest request, TransferDbContext db, PasswordHasher<CustomerAccount> hasher) => {
+    var email = request.Email.Trim().ToLowerInvariant(); var customer = await db.CustomerAccounts.SingleOrDefaultAsync(c => c.Email == email && c.IsActive);
+    if (customer is null || hasher.VerifyHashedPassword(customer, customer.PasswordHash, request.Password) == PasswordVerificationResult.Failed) return Results.Unauthorized();
+    var session = await CreateCustomerSessionAsync(customer, db);
+    return Results.Ok(new { customer.Id, customer.Name, customer.Email, role = "Customer", sessionToken = session.Token, expiresAtUtc = session.ExpiresAtUtc });
+}).AllowAnonymous();
+app.MapGet("/api/client/me", async (ClaimsPrincipal user, TransferDbContext db) => {
+    var id = int.Parse(user.FindFirstValue("customer_id")!); var customer = await db.CustomerAccounts.AsNoTracking().SingleOrDefaultAsync(c => c.Id == id && c.IsActive);
+    return customer is null ? Results.Unauthorized() : Results.Ok(new { customer.Id, customer.Name, customer.Email, role = "Customer" });
+}).RequireAuthorization();
+app.MapGet("/api/client/currencies", async (TransferDbContext db) => {
+    var configured = await db.CurrencyRates.AsNoTracking().Where(rate => rate.UnitsPerUsd > 0).Select(rate => rate.CurrencyCode).ToListAsync();
+    configured.Add("USD");
+    return Results.Ok(supportedCurrencyNames.Where(item => configured.Contains(item.Key, StringComparer.OrdinalIgnoreCase)).Select(item => new { currencyCode = item.Key, name = item.Value }));
+});
+app.MapGet("/api/client/payment-instructions", (IConfiguration configuration) => Results.Ok(new { instructions = configuration["CustomerPayments:Instructions"] ?? "" }));
+app.MapGet("/api/client/destinations", async (TransferDbContext db) => Results.Ok(await db.DestinationCities.AsNoTracking().OrderBy(c => c.Country).ThenBy(c => c.City).Select(c => new { c.Country, c.City }).ToListAsync()));
+decimal CustomerWalletBalance(int customerId, string currencyCode, TransferDbContext db) {
+    var entries = db.CustomerWalletEntries.AsNoTracking().Where(e => e.CustomerAccountId == customerId && e.CurrencyCode == currencyCode);
+    return (entries.Where(e => e.Kind == "TopUp" && e.Status == "Approved").Sum(e => (decimal?)e.Amount) ?? 0m)
+        - (entries.Where(e => e.Kind == "Debit" && (e.Status == "Reserved" || e.Status == "Posted")).Sum(e => (decimal?)e.Amount) ?? 0m);
+}
+app.MapGet("/api/client/wallet", async (ClaimsPrincipal user, TransferDbContext db) => {
+    var id = int.Parse(user.FindFirstValue("customer_id")!);
+    var entries = await db.CustomerWalletEntries.AsNoTracking().Where(e => e.CustomerAccountId == id).OrderByDescending(e => e.CreatedAtUtc).Take(100).Select(e => new { e.Id, e.Kind, e.Status, e.CurrencyCode, e.Amount, e.Reference, e.PaymentReference, e.CreatedAtUtc }).ToListAsync();
+    var balances = supportedCurrencyNames.Keys.Select(code => new { currencyCode = code, balance = CustomerWalletBalance(id, code, db) }).Where(b => b.balance != 0).ToList();
+    return Results.Ok(new { balances, entries });
+}).RequireAuthorization();
+app.MapPost("/api/client/wallet/top-ups", async (CustomerTopUpRequest request, ClaimsPrincipal user, TransferDbContext db) => {
+    var code = NormalizeCurrency(request.CurrencyCode); var reference = request.PaymentReference?.Trim();
+    if (!supportedCurrencyNames.ContainsKey(code)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["currencyCode"] = ["Choose a supported currency."] });
+    if (request.Amount <= 0 || request.Amount > 1000000m || decimal.Round(request.Amount, 2) != request.Amount) return Results.ValidationProblem(new Dictionary<string, string[]> { ["amount"] = ["Enter a positive amount with no more than two decimal places."] });
+    if (string.IsNullOrWhiteSpace(reference) || reference.Length > 120) return Results.ValidationProblem(new Dictionary<string, string[]> { ["paymentReference"] = ["Enter the bank or mobile money payment reference after making the payment."] });
+    var id = int.Parse(user.FindFirstValue("customer_id")!);
+    if (await db.CustomerWalletEntries.AnyAsync(e => e.Kind == "TopUp" && e.PaymentReference == reference && e.Status != "Rejected")) return Results.Conflict(new { message = "That payment reference has already been submitted. Check the reference or contact support." });
+    var entry = new CustomerWalletEntry { CustomerAccountId = id, Kind = "TopUp", Status = "Pending", CurrencyCode = code, Amount = request.Amount, Reference = $"SIW-{Guid.NewGuid():N}"[..20].ToUpperInvariant(), PaymentReference = reference, CreatedAtUtc = DateTime.UtcNow };
+    db.CustomerWalletEntries.Add(entry); await db.SaveChangesAsync();
+    return Results.Created($"/api/client/wallet/top-ups/{entry.Id}", new { entry.Id, entry.Reference, entry.Status, entry.CurrencyCode, entry.Amount, entry.CreatedAtUtc });
+}).RequireAuthorization();
+app.MapPost("/api/client/wallet/cashify-simulation", async (CashifyPaymentRequest request, ClaimsPrincipal user, TransferDbContext db) => {
+    var provider = request.Provider.Trim();
+    if (provider is not ("EcoCash" or "Airtel Money")) return Results.ValidationProblem(new Dictionary<string, string[]> { ["provider"] = ["Choose EcoCash or Airtel Money in the Cashify simulator."] });
+    var phone = request.PhoneNumber.Trim();
+    if (!System.Text.RegularExpressions.Regex.IsMatch(phone, @"^\+?[0-9]{8,16}$")) return Results.ValidationProblem(new Dictionary<string, string[]> { ["phoneNumber"] = ["Enter a simulated phone number with 8 to 16 digits, optionally beginning with +."] });
+    var code = NormalizeCurrency(request.CurrencyCode);
+    if (!supportedCurrencyNames.ContainsKey(code)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["currencyCode"] = ["Choose a supported wallet currency."] });
+    if (request.Amount <= 0 || request.Amount > 1000000m || decimal.Round(request.Amount, 2) != request.Amount) return Results.ValidationProblem(new Dictionary<string, string[]> { ["amount"] = ["Enter a positive amount with no more than two decimal places."] });
+    var customerId = int.Parse(user.FindFirstValue("customer_id")!);
+    var providerTransactionId = $"CF-SIM-{Guid.NewGuid():N}"[..19].ToUpperInvariant();
+    var payeeAccount = $"SI-CASHIFY-{customerId:D8}";
+    await using var transaction = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+    var entry = new CustomerWalletEntry { CustomerAccountId = customerId, Kind = "TopUp", Status = "Approved", CurrencyCode = code, Amount = request.Amount, Reference = $"SIW-{Guid.NewGuid():N}"[..20].ToUpperInvariant(), PaymentReference = $"Cashify SIM | {provider} | {phone} | {providerTransactionId}", CreatedAtUtc = DateTime.UtcNow, ReviewedAtUtc = DateTime.UtcNow };
+    db.CustomerWalletEntries.Add(entry); await db.SaveChangesAsync(); await transaction.CommitAsync();
+    return Results.Created($"/api/client/wallet/cashify-simulation/{entry.Id}", new { entry.Id, entry.Reference, entry.Status, entry.CurrencyCode, entry.Amount, entry.CreatedAtUtc, provider, providerTransactionId, payeeName = "Shameen Investments", payeeAccount, simulationOnly = true, walletBalance = CustomerWalletBalance(customerId, code, db) });
+}).RequireAuthorization();
+app.MapPost("/api/client/transfers", async (CustomerTransferRequestPayload request, ClaimsPrincipal user, TransferDbContext db) => {
+    var customerId = int.Parse(user.FindFirstValue("customer_id")!); var source = NormalizeCurrency(request.SourceCurrency); var payout = NormalizeCurrency(request.PayoutCurrency);
+    if (string.IsNullOrWhiteSpace(request.RecipientName) || request.RecipientName.Trim().Length > 160) return Results.ValidationProblem(new Dictionary<string, string[]> { ["recipientName"] = ["Enter the recipient’s full name."] });
+    if (!supportedCurrencyNames.ContainsKey(source) || !supportedCurrencyNames.ContainsKey(payout)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["currency"] = ["Choose supported sending and payout currencies."] });
+    if (request.Amount <= 0 || decimal.Round(request.Amount, 2) != request.Amount) return Results.ValidationProblem(new Dictionary<string, string[]> { ["amount"] = ["Enter a positive amount with no more than two decimal places."] });
+    var country = supportedCollectionCountries.FirstOrDefault(c => c.Equals(request.DestinationCountry.Trim(), StringComparison.OrdinalIgnoreCase));
+    if (country is null || !await db.DestinationCities.AnyAsync(c => c.Country == country && c.City == request.DestinationCity.Trim())) return Results.ValidationProblem(new Dictionary<string, string[]> { ["destinationCity"] = ["Choose a destination country and city from the list."] });
+    if (request.PayoutMethod is not ("Cash pickup" or "Mobile money" or "Bank deposit")) return Results.ValidationProblem(new Dictionary<string, string[]> { ["payoutMethod"] = ["Choose cash pickup, mobile money, or bank deposit."] });
+    await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+    var sourceRate = source == "USD" ? 1m : await db.CurrencyRates.Where(rate => rate.CurrencyCode == source).Select(rate => (decimal?)rate.UnitsPerUsd).SingleOrDefaultAsync() ?? 0m;
+    var payoutRate = payout == "USD" ? 1m : await db.CurrencyRates.Where(rate => rate.CurrencyCode == payout).Select(rate => (decimal?)rate.UnitsPerUsd).SingleOrDefaultAsync() ?? 0m;
+    if (sourceRate <= 0 || payoutRate <= 0) return Results.Conflict(new { message = "The exchange rate for this currency pair is not available. Please choose another currency or contact support." });
+    var exchangeRate = payoutRate / sourceRate;
+    var payoutAmount = decimal.Round(request.Amount * exchangeRate, 2, MidpointRounding.AwayFromZero);
+    var balance = CustomerWalletBalance(customerId, source, db);
+    if (request.Amount > balance) return Results.Conflict(new { message = $"Your available wallet balance is {balance:0.00} {source}. Add funds before requesting this transfer." });
+    var debit = new CustomerWalletEntry { CustomerAccountId = customerId, Kind = "Debit", Status = "Reserved", CurrencyCode = source, Amount = request.Amount, Reference = $"SIW-{Guid.NewGuid():N}"[..20].ToUpperInvariant(), CreatedAtUtc = DateTime.UtcNow };
+    var transferRequest = new CustomerTransferRequest { CustomerAccountId = customerId, Reference = $"SIR-{Guid.NewGuid():N}"[..20].ToUpperInvariant(), RecipientName = request.RecipientName.Trim(), DestinationCountry = country, DestinationCity = request.DestinationCity.Trim(), SourceCurrency = source, Amount = request.Amount, PayoutCurrency = payout, PayoutAmount = payoutAmount, ExchangeRate = exchangeRate, PayoutMethod = request.PayoutMethod, Status = "Pending review", CreatedAtUtc = DateTime.UtcNow, WalletDebitEntryId = debit.Id };
+    db.CustomerWalletEntries.Add(debit); db.CustomerTransferRequests.Add(transferRequest); await db.SaveChangesAsync();
+    transferRequest.WalletDebitEntryId = debit.Id; await db.SaveChangesAsync(); await tx.CommitAsync();
+    return Results.Created($"/api/client/transfers/{transferRequest.Id}", new { transferRequest.Id, transferRequest.Reference, transferRequest.Status, transferRequest.Amount, transferRequest.SourceCurrency, transferRequest.PayoutAmount, transferRequest.PayoutCurrency, transferRequest.ExchangeRate, transferRequest.DestinationCountry, transferRequest.DestinationCity, transferRequest.CreatedAtUtc });
+}).RequireAuthorization();
+app.MapGet("/api/client/transfers", async (ClaimsPrincipal user, TransferDbContext db) => {
+    var id = int.Parse(user.FindFirstValue("customer_id")!);
+    return Results.Ok(await db.CustomerTransferRequests.AsNoTracking().Where(r => r.CustomerAccountId == id).OrderByDescending(r => r.CreatedAtUtc).Take(100).Select(r => new { r.Id, r.Reference, r.RecipientName, r.DestinationCountry, r.DestinationCity, r.SourceCurrency, r.Amount, r.PayoutCurrency, r.PayoutAmount, r.ExchangeRate, r.PayoutMethod, r.Status, r.CreatedAtUtc }).ToListAsync());
+}).RequireAuthorization();
+app.MapGet("/api/customer-requests", async (ClaimsPrincipal user, TransferDbContext db) => {
+    if (!IsManager(user)) return Results.Forbid();
+    var pendingTopUps = await db.CustomerWalletEntries.AsNoTracking().Where(e => e.Kind == "TopUp" && e.Status == "Pending").OrderBy(e => e.CreatedAtUtc).Select(e => new { e.Id, e.Reference, customerName = e.Customer!.Name, customerEmail = e.Customer.Email, e.CurrencyCode, e.Amount, e.PaymentReference, e.CreatedAtUtc, kind = e.Kind, destination = (string?)null, city = (string?)null, e.Status }).ToListAsync();
+    var pendingTransfers = await db.CustomerTransferRequests.AsNoTracking().Where(r => r.Status == "Pending review").OrderBy(r => r.CreatedAtUtc).Select(r => new { id = r.Id, r.Reference, customerName = r.Customer!.Name, customerEmail = r.Customer.Email, currencyCode = r.SourceCurrency, r.Amount, r.PayoutCurrency, r.PayoutAmount, paymentReference = (string?)null, r.CreatedAtUtc, kind = "Transfer", destination = r.DestinationCountry, city = r.DestinationCity, r.Status }).ToListAsync();
+    var cashifyPayments = await db.CustomerWalletEntries.AsNoTracking().Where(e => e.Kind == "TopUp" && e.Status == "Approved" && e.PaymentReference != null && e.PaymentReference.StartsWith("Cashify SIM | ")).OrderByDescending(e => e.CreatedAtUtc).Take(100).Select(e => new { e.Id, e.Reference, customerName = e.Customer!.Name, customerEmail = e.Customer.Email, currencyCode = e.CurrencyCode, e.Amount, paymentReference = e.PaymentReference, createdAtUtc = e.CreatedAtUtc }).ToListAsync();
+    return Results.Ok(new { topUps = pendingTopUps, transfers = pendingTransfers, cashifyPayments });
+}).RequireAuthorization();
+app.MapPost("/api/customer-requests/top-ups/{id:long}/review", async (long id, ReviewCustomerRequest request, ClaimsPrincipal user, TransferDbContext db) => {
+    if (!IsManager(user)) return Results.Forbid();
+    if (request.Decision is not ("approve" or "reject")) return Results.ValidationProblem(new Dictionary<string, string[]> { ["decision"] = ["Choose approve or reject."] });
+    var entry = await db.CustomerWalletEntries.SingleOrDefaultAsync(e => e.Id == id && e.Kind == "TopUp");
+    if (entry is null) return Results.NotFound(); if (entry.Status != "Pending") return Results.Conflict(new { message = "This top-up has already been reviewed." });
+    entry.Status = request.Decision == "approve" ? "Approved" : "Rejected"; entry.ReviewedAtUtc = DateTime.UtcNow; entry.ReviewedByEmployeeId = EmployeeIdFor(user); await db.SaveChangesAsync();
+    return Results.Ok(new { entry.Id, entry.Status });
+}).RequireAuthorization();
+app.MapPost("/api/customer-requests/transfers/{id:long}/review", async (long id, ReviewCustomerRequest request, ClaimsPrincipal user, TransferDbContext db) => {
+    if (!IsManager(user)) return Results.Forbid();
+    if (request.Decision is not ("approve" or "reject")) return Results.ValidationProblem(new Dictionary<string, string[]> { ["decision"] = ["Choose approve or reject."] });
+    await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+    var transferRequest = await db.CustomerTransferRequests.SingleOrDefaultAsync(r => r.Id == id);
+    if (transferRequest is null) return Results.NotFound(); if (transferRequest.Status != "Pending review") return Results.Conflict(new { message = "This request has already been reviewed." });
+    var debit = await db.CustomerWalletEntries.SingleOrDefaultAsync(e => e.Id == transferRequest.WalletDebitEntryId);
+    if (debit is null || debit.Status != "Reserved") return Results.Conflict(new { message = "The wallet reservation could not be verified." });
+    var approved = request.Decision == "approve"; transferRequest.Status = approved ? "Accepted for processing" : "Declined"; transferRequest.ReviewedAtUtc = DateTime.UtcNow; transferRequest.ReviewedByEmployeeId = EmployeeIdFor(user); debit.Status = approved ? "Posted" : "Rejected"; debit.ReviewedAtUtc = DateTime.UtcNow; debit.ReviewedByEmployeeId = EmployeeIdFor(user);
+    await db.SaveChangesAsync(); await tx.CommitAsync(); return Results.Ok(new { transferRequest.Id, transferRequest.Status });
+}).RequireAuthorization();
 app.MapPut("/api/auth/password", async (ChangeOwnPasswordRequest request, ClaimsPrincipal user, TransferDbContext db, PasswordHasher<Employee> hasher) => {
     if (string.IsNullOrWhiteSpace(request.NewPassword) || request.NewPassword.Length < 12) return Results.ValidationProblem(new Dictionary<string, string[]> { ["newPassword"] = ["New password must be at least 12 characters."] });
     var employeeId = EmployeeIdFor(user);
@@ -242,8 +390,13 @@ app.MapPut("/api/currencies/rates", async (UpdateCurrencyRatesRequest request, T
 }).RequireAuthorization();
 app.MapPost("/api/auth/logout", async (ClaimsPrincipal user, TransferDbContext db) => {
     if (long.TryParse(user.FindFirstValue("session_id"), out var sessionId)) {
+        if (user.IsInRole("Customer")) {
+            var clientSession = await db.CustomerSessions.SingleOrDefaultAsync(s => s.Id == sessionId);
+            if (clientSession is not null && clientSession.RevokedAtUtc is null) { clientSession.RevokedAtUtc = DateTime.UtcNow; await db.SaveChangesAsync(); }
+        } else {
         var session = await db.AuthSessions.SingleOrDefaultAsync(s => s.Id == sessionId);
         if (session is not null && session.RevokedAtUtc is null) { session.RevokedAtUtc = DateTime.UtcNow; await db.SaveChangesAsync(); }
+        }
     }
     return Results.Ok(new { signedOut = true });
 }).RequireAuthorization();

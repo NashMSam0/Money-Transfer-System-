@@ -10,6 +10,20 @@ export class ApiService {
   authStatus() { return this.http.get<{ needsAdministratorSetup: boolean }>('/api/auth/status'); }
   me() { return this.http.get<any>('/api/auth/me'); }
   login(credentials: { email: string; password: string }) { return this.http.post<any>('/api/auth/login', credentials).pipe(tap(response => this.storeSession(response))); }
+  clientLogin(credentials: { email: string; password: string }) { return this.http.post<any>('/api/client/login', credentials).pipe(tap(response => this.storeSession(response))); }
+  clientRegister(account: { name: string; email: string; password: string }) { return this.http.post<any>('/api/client/register', account).pipe(tap(response => this.storeSession(response))); }
+  clientMe() { return this.http.get<any>('/api/client/me'); }
+  clientWallet() { return this.http.get<any>('/api/client/wallet'); }
+  clientTopUp(request: { currencyCode:string; amount:number; paymentReference:string }) { return this.http.post<any>('/api/client/wallet/top-ups', request); }
+  clientCashifySimulation(request: { provider:string; phoneNumber:string; currencyCode:string; amount:number }) { return this.http.post<any>('/api/client/wallet/cashify-simulation', request); }
+  clientCreateTransfer(request: { recipientName:string; destinationCountry:string; destinationCity:string; sourceCurrency:string; amount:number; payoutCurrency:string; payoutMethod:string }) { return this.http.post<any>('/api/client/transfers', request); }
+  clientTransfers() { return this.http.get<any[]>('/api/client/transfers'); }
+  clientDestinations() { return this.http.get<any[]>('/api/client/destinations'); }
+  clientCurrencies() { return this.http.get<any[]>('/api/client/currencies'); }
+  clientPaymentInstructions() { return this.http.get<{instructions:string}>('/api/client/payment-instructions'); }
+  getCustomerRequests() { return this.http.get<any>('/api/customer-requests'); }
+  reviewCustomerTopUp(id:number,decision:'approve'|'reject') { return this.http.post<any>(`/api/customer-requests/top-ups/${id}/review`,{decision}); }
+  reviewCustomerTransfer(id:number,decision:'approve'|'reject') { return this.http.post<any>(`/api/customer-requests/transfers/${id}/review`,{decision}); }
   changeOwnPassword(currentPassword: string, newPassword: string) { return this.http.put('/api/auth/password', { currentPassword, newPassword }); }
   setupAdministrator(account: { name: string; email: string; password: string }) { return this.http.post<any>('/api/auth/setup', account).pipe(tap(response => this.storeSession(response))); }
   logout() { return this.http.post('/api/auth/logout', {}).pipe(finalize(() => sessionStorage.removeItem(this.sessionKey))); }

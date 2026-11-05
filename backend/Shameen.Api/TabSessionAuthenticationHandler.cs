@@ -32,7 +32,24 @@ public sealed class TabSessionAuthenticationHandler : AuthenticationHandler<Auth
             .Where(s => s.TokenHash == tokenHash && s.RevokedAtUtc == null && s.ExpiresAtUtc > now)
             .Select(s => new { s.Id, s.EmployeeId })
             .SingleOrDefaultAsync(Context.RequestAborted);
-        if (session is null) return AuthenticateResult.Fail("Session expired or signed out.");
+        if (session is null)
+        {
+            var clientSession = await _db.CustomerSessions.AsNoTracking()
+                .Where(s => s.TokenHash == tokenHash && s.RevokedAtUtc == null && s.ExpiresAtUtc > now)
+                .Select(s => new { s.Id, s.CustomerAccountId })
+                .SingleOrDefaultAsync(Context.RequestAborted);
+            if (clientSession is null) return AuthenticateResult.Fail("Session expired or signed out.");
+            var customer = await _db.CustomerAccounts.AsNoTracking()
+                .SingleOrDefaultAsync(c => c.Id == clientSession.CustomerAccountId && c.IsActive, Context.RequestAborted);
+            if (customer is null) return AuthenticateResult.Fail("Customer account is inactive.");
+            var clientClaims = new List<Claim>
+            {
+                new(ClaimTypes.NameIdentifier, customer.Id.ToString()), new(ClaimTypes.Name, customer.Name),
+                new(ClaimTypes.Email, customer.Email), new(ClaimTypes.Role, "Customer"),
+                new("session_id", clientSession.Id.ToString()), new("customer_id", customer.Id.ToString())
+            };
+            return AuthenticateResult.Success(new AuthenticationTicket(new ClaimsPrincipal(new ClaimsIdentity(clientClaims, Scheme.Name)), Scheme.Name));
+        }
 
         var employee = await _db.Employees.AsNoTracking().Include(e => e.Branch)
             .SingleOrDefaultAsync(e => e.Id == session.EmployeeId && e.IsActive, Context.RequestAborted);
